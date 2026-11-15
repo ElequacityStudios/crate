@@ -1390,6 +1390,7 @@ impl Inner {
         }
         self.fences.clear();
         self.gl.retired.borrow_mut().clear();
+        self.gl.retired_context.borrow_mut().clear();
         // SAFETY: a plain call.
         unsafe { (self.virgl.virgl_renderer_reset)() };
     }
