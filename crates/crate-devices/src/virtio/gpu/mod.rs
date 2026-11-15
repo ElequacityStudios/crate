@@ -30,6 +30,7 @@ use std::collections::{HashMap, VecDeque};
 use std::os::fd::AsRawFd;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
+use std::ptr;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -1533,7 +1534,7 @@ impl Worker {
                     warn!("virtio-gpu: reading resource {}: {e}", scanout.resource);
                 }
             }
-            Kind::Blob { memory, mapped, backing, backing_len, .. } => {
+            Kind::Blob { memory, mapped, backing, .. } => {
                 let Some(blob) = scanout.blob else { return };
                 for line in 0..area.height as usize {
                     let source_offset = blob.offset
@@ -1543,10 +1544,7 @@ impl Worker {
                     let to = start + line * stride;
                     let out = &mut scanout.screen[to..to + row];
                     if *memory == 1 {
-                        if copy_from_backing(backing, *backing_len, source_offset as usize, out).is_err() {
-                            warn!("virtio-gpu: reading guest blob {}", scanout.resource);
-                            return;
-                        }
+                        copy_from_backing(backing, source_offset as usize, out);
                     } else {
                         let Some(mapped_offset) = mapped else { return };
                         let Some(host_memory) = &self.host_visible_memory else { return };
