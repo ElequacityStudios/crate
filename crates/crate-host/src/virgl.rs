@@ -1395,7 +1395,7 @@ impl Inner {
             self.detach(resource);
         }
         self.fences.clear();
-        self.gl.retired.borrow_mut().clear();
+        self.gl.retired.lock().unwrap().clear();
         self.gl.retired_context.lock().unwrap().clear();
         // SAFETY: a plain call.
         unsafe { (self.virgl.virgl_renderer_reset)() };
