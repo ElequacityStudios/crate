@@ -2,13 +2,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use super::super::queue::QueueConfig;
 use super::super::queue::testing::*;
 use super::*;
-use crate_core::gpu::{ContextFence, RendererResult};
+use crate_core::gpu::{BlobResource, ContextFence, RendererResult};
+use crate_core::memory::{HeapRam, RamBlock};
 use crate_core::irq::{IrqLine, LevelRecorder};
 
 const CURSOR_RINGS: u64 = RAM_BASE + 0x4000;
@@ -57,16 +59,116 @@ fn cursor_config() -> QueueConfig {
 }
 
 fn machine(renderer: Option<RendererFactory>) -> Machine {
-    let memory = memory();
+    machine_with_memory(renderer, memory(), None, None)
+}
+
+const HOST_VISIBLE_BASE: u64 = RAM_BASE + 0x10_0000;
+const HOST_VISIBLE_SIZE: usize = 0x1_0000;
+
+struct TestHostVisibleMemory {
+    ram: HeapRam,
+    guest_addr: u64,
+    mappings: Mutex<std::collections::HashMap<u64, usize>>,
+}
+
+impl TestHostVisibleMemory {
+    fn new(guest_addr: u64, len: usize) -> Self {
+        assert_eq!(guest_addr % 4_096, 0);
+        assert_eq!(len % 4_096, 0);
+        Self {
+            ram: HeapRam::new(len).unwrap(),
+            guest_addr,
+            mappings: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+unsafe impl RamBlock for TestHostVisibleMemory {
+    fn as_ptr(&self) -> *mut u8 {
+        self.ram.as_ptr()
+    }
+    fn len(&self) -> usize {
+        self.ram.len()
+    }
+}
+
+impl HostVisibleMemory for TestHostVisibleMemory {
+    fn guest_addr(&self) -> u64 {
+        self.guest_addr
+    }
+    fn alignment(&self) -> u32 {
+        4_096
+    }
+    fn reserve(&self, guest_addr: u64, len: usize) -> io::Result<*mut u8> {
+        let offset = guest_addr
+            .checked_sub(self.guest_addr)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "outside host memory"))?;
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= self.ram.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "mapping out of range"))?;
+        let mut mappings = self.mappings.lock().unwrap();
+        if mappings.contains_key(&guest_addr) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "already mapped"));
+        }
+        mappings.insert(guest_addr, end - offset);
+        // SAFETY: the checked range lies within the owned HeapRam allocation.
+        Ok(unsafe { self.ram.as_ptr().add(offset) })
+    }
+    fn map_fd(&self, _guest_addr: u64, _fd: std::os::fd::RawFd, _len: usize) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "not used by this test"))
+    }
+    fn unmap(&self, guest_addr: u64) -> io::Result<()> {
+        self.mappings
+            .lock()
+            .unwrap()
+            .remove(&guest_addr)
+            .map(|_| ())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not mapped"))
+    }
+}
+
+fn machine_with_host_visible(
+    renderer: Option<RendererFactory>,
+    host: Arc<TestHostVisibleMemory>,
+) -> Machine {
+    machine_with_host_visible_features(renderer, host, None)
+}
+
+fn machine_with_host_visible_features(
+    renderer: Option<RendererFactory>,
+    host: Arc<TestHostVisibleMemory>,
+    negotiated_features: Option<u64>,
+) -> Machine {
+    let ram: Arc<dyn RamBlock> = Arc::new(HeapRam::new(0x10_0000).unwrap());
+    let host_ram: Arc<dyn RamBlock> = host.clone();
+    let memory = Arc::new(
+        GuestMemory::new(vec![(RAM_BASE, ram), (host.guest_addr(), host_ram)]).unwrap(),
+    );
+    let host_visible_memory: Arc<dyn HostVisibleMemory> = host;
+    machine_with_memory(renderer, memory, Some(host_visible_memory), negotiated_features)
+}
+
+fn machine_with_memory(
+    renderer: Option<RendererFactory>,
+    memory: Arc<GuestMemory>,
+    host_visible_memory: Option<Arc<dyn HostVisibleMemory>>,
+    negotiated_features: Option<u64>,
+) -> Machine {
     let screen = Arc::new(Screen::default());
     screen.active.store(true, Ordering::Relaxed);
+    let has_host_visible_memory = host_visible_memory.is_some();
     let mut gpu = Gpu::new(GpuConfig {
         modes: vec![Mode::new(800, 600), Mode::new(640, 480)],
         sink: screen.clone(),
         renderer,
-        host_visible_memory: None,
+        host_visible_memory,
     })
     .unwrap();
+    let features = negotiated_features.unwrap_or_else(|| {
+        if has_host_visible_memory { gpu.features() } else { F_VERSION_1 }
+    });
     gpu.activate(Activation {
         memory: memory.clone(),
         queues: vec![
@@ -74,7 +176,7 @@ fn machine(renderer: Option<RendererFactory>) -> Machine {
             Queue::new(memory.clone(), cursor_config()),
         ],
         interrupt: Interrupt::new(IrqLine::new(Arc::new(LevelRecorder::default()), 0)),
-        features: F_VERSION_1,
+        features,
     });
     Machine {
         gpu,
@@ -429,8 +531,13 @@ struct FakeState {
     retire: usize,
     submitted: Vec<u32>,
     contexts: Vec<(u32, u32)>,
+    context_names: Vec<Vec<u8>>,
     context_fences: Vec<(u32, u32, u64)>,
     retired_context_fences: Vec<ContextFence>,
+    blobs: Vec<BlobResource>,
+    attached: Vec<u32>,
+    detached: Vec<u32>,
+    map_data: Vec<u8>,
 }
 
 struct Fake(Arc<Mutex<FakeState>>);
@@ -438,6 +545,27 @@ struct Fake(Arc<Mutex<FakeState>>);
 impl Renderer for Fake {
     fn description(&self) -> String {
         "fake".into()
+    }
+    fn supports_blob(&self) -> bool {
+        true
+    }
+    fn blob_alignment(&self) -> u32 {
+        4_096
+    }
+    fn create_blob(&mut self, blob: &BlobResource, _backing: &[HostSlice]) -> RendererResult<()> {
+        self.0.lock().unwrap().blobs.push(*blob);
+        Ok(())
+    }
+    fn map_blob_fixed(&mut self, _resource: u32, host_addr: *mut u8) -> RendererResult<bool> {
+        let data = self.0.lock().unwrap().map_data.clone();
+        if !data.is_empty() {
+            // SAFETY: the test maps a blob larger than this test pixel payload.
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), host_addr, data.len()) };
+        }
+        Ok(true)
+    }
+    fn blob_map_info(&mut self, _resource: u32) -> RendererResult<u32> {
+        Ok(1)
     }
     fn capsets(&self) -> Vec<Capset> {
         vec![
@@ -456,8 +584,10 @@ impl Renderer for Fake {
     fn fill_capset(&mut self, _id: u32, _version: u32, out: &mut [u8]) {
         out.fill(0xcc);
     }
-    fn create_context(&mut self, context: u32, context_init: u32, _name: &[u8]) -> RendererResult<()> {
-        self.0.lock().unwrap().contexts.push((context, context_init));
+    fn create_context(&mut self, context: u32, context_init: u32, name: &[u8]) -> RendererResult<()> {
+        let mut state = self.0.lock().unwrap();
+        state.contexts.push((context, context_init));
+        state.context_names.push(name.to_vec());
         Ok(())
     }
     fn create_context_fence(
@@ -480,10 +610,13 @@ impl Renderer for Fake {
         Ok(())
     }
     fn destroy_resource(&mut self, _resource: u32) {}
-    unsafe fn attach_backing(&mut self, _r: u32, _b: Vec<HostSlice>) -> RendererResult<()> {
+    unsafe fn attach_backing(&mut self, resource: u32, _backing: Vec<HostSlice>) -> RendererResult<()> {
+        self.0.lock().unwrap().attached.push(resource);
         Ok(())
     }
-    fn detach_backing(&mut self, _resource: u32) {}
+    fn detach_backing(&mut self, resource: u32) {
+        self.0.lock().unwrap().detached.push(resource);
+    }
     fn transfer_to_host(&mut self, _t: &Transfer) -> RendererResult<()> {
         Ok(())
     }
@@ -524,7 +657,8 @@ fn answers_fences_once_the_renderer_retires_them() {
     assert!(m.gpu.has_3d());
     let mut capsets = [0u8; 4];
     m.gpu.read_config(12, &mut capsets);
-    assert_eq!(u32::from_le_bytes(capsets), 2);
+    assert_eq!(u32::from_le_bytes(capsets), 1, "Venus is hidden without host-visible blobs");
+    assert_eq!(m.gpu.features & F_CONTEXT_INIT, 0);
 
     let mut r = header(CMD_GET_CAPSET, 0, 0);
     r.extend(words(&[1, 1]));
@@ -580,36 +714,215 @@ fn a_reset_forgets_everything() {
     m.send_ok(CMD_RESOURCE_CREATE_2D, &[1, format::B8G8R8X8, 4, 4]);
 }
 
+fn create_venus_context(m: &mut Machine, context: u32) {
+    let mut create = header(CMD_CTX_CREATE, 0, 0);
+    create[16..20].copy_from_slice(&context.to_le_bytes());
+    create.extend(words(&[0, CAPSET_VENUS]));
+    let answer = m.send(&create);
+    assert_eq!(
+        u32::from_le_bytes(answer[0..4].try_into().unwrap()),
+        RESP_OK_NODATA
+    );
+}
+
+fn submit_venus_fence(m: &mut Machine, context: u32, ring: u8, fence: u64, slot: u64) {
+    let mut submit = header(CMD_SUBMIT_3D, FLAG_FENCE | FLAG_INFO_RING_IDX, fence);
+    submit[16..20].copy_from_slice(&context.to_le_bytes());
+    submit[20] = ring;
+    submit.extend(words(&[4, 0, 0xfeed]));
+    m.send_at(&submit, slot);
+}
+
+#[test]
+fn legacy_context_name_uses_the_non_context_init_layout() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let fake = state.clone();
+    let mut m = machine(Some(Box::new(move || Ok(Box::new(Fake(fake)) as Box<dyn Renderer>))));
+    assert_eq!(m.gpu.features & F_CONTEXT_INIT, 0);
+
+    let mut create = header(CMD_CTX_CREATE, 0, 0);
+    create[16..20].copy_from_slice(&1u32.to_le_bytes());
+    create.extend(4u32.to_le_bytes());
+    create.extend_from_slice(b"test");
+    let answer = m.send(&create);
+    assert_eq!(u32::from_le_bytes(answer[0..4].try_into().unwrap()), RESP_OK_NODATA);
+    assert_eq!(state.lock().unwrap().context_names, vec![b"test".to_vec()]);
+}
+
+#[test]
+fn venus_capset_does_not_force_context_init_without_feature_negotiation() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let fake = state.clone();
+    let host = Arc::new(TestHostVisibleMemory::new(HOST_VISIBLE_BASE, HOST_VISIBLE_SIZE));
+    let mut m = machine_with_host_visible_features(
+        Some(Box::new(move || Ok(Box::new(Fake(fake)) as Box<dyn Renderer>))),
+        host,
+        Some(F_VERSION_1),
+    );
+    assert_ne!(m.gpu.features & F_CONTEXT_INIT, 0, "the feature is offered");
+    let mut create = header(CMD_CTX_CREATE, 0, 0);
+    create[16..20].copy_from_slice(&1u32.to_le_bytes());
+    create.extend(4u32.to_le_bytes());
+    create.extend_from_slice(b"test");
+    let answer = m.send(&create);
+    assert_eq!(u32::from_le_bytes(answer[0..4].try_into().unwrap()), RESP_OK_NODATA);
+    {
+        let state = state.lock().unwrap();
+        assert_eq!(state.contexts, vec![(1, 0)]);
+        assert_eq!(state.context_names, vec![b"test".to_vec()]);
+    }
+
+    // The ring-index flag is invalid unless F_CONTEXT_INIT was negotiated.
+    // Reject it before submitting any guest command to the renderer.
+    let mut submit = header(CMD_SUBMIT_3D, FLAG_FENCE | FLAG_INFO_RING_IDX, 7);
+    submit[16..20].copy_from_slice(&1u32.to_le_bytes());
+    submit[20] = 3;
+    submit.extend(words(&[4, 0, 0xfeed]));
+    let answer = m.send(&submit);
+    assert_eq!(
+        u32::from_le_bytes(answer[0..4].try_into().unwrap()),
+        RESP_ERR_INVALID_PARAMETER
+    );
+    let state = state.lock().unwrap();
+    assert!(state.context_fences.is_empty());
+    assert!(state.submitted.is_empty());
+}
+
 #[test]
 fn venus_context_init_and_timeline_fences_are_forwarded() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let fake = state.clone();
-    let mut m = machine(Some(Box::new(move || {
-        Ok(Box::new(Fake(fake)) as Box<dyn Renderer>)
-    })));
+    let host = Arc::new(TestHostVisibleMemory::new(HOST_VISIBLE_BASE, HOST_VISIBLE_SIZE));
+    let mut m = machine_with_host_visible(
+        Some(Box::new(move || Ok(Box::new(Fake(fake)) as Box<dyn Renderer>))),
+        host,
+    );
     assert_ne!(m.gpu.features & F_CONTEXT_INIT, 0);
+    assert_ne!(m.gpu.features & F_RESOURCE_BLOB, 0);
+    assert_ne!(m.gpu.features & F_BLOB_ALIGNMENT, 0);
 
-    let mut create = header(CMD_CTX_CREATE, 0, 0);
-    create[16..20].copy_from_slice(&1u32.to_le_bytes());
-    create.extend(words(&[0, CAPSET_VENUS]));
-    let answer = m.send(&create);
-    assert_eq!(u32::from_le_bytes(answer[0..4].try_into().unwrap()), RESP_OK_NODATA);
-    assert_eq!(state.lock().unwrap().contexts, [(1, CAPSET_VENUS)]);
+    create_venus_context(&mut m, 1);
+    create_venus_context(&mut m, 2);
+    assert_eq!(
+        state.lock().unwrap().contexts,
+        vec![(1, CAPSET_VENUS), (2, CAPSET_VENUS)]
+    );
 
-    let mut submit = header(CMD_SUBMIT_3D, FLAG_FENCE | FLAG_INFO_RING_IDX, 41);
-    submit[16..20].copy_from_slice(&1u32.to_le_bytes());
-    submit[20] = 3;
-    submit.extend(words(&[4, 0, 0xfeed]));
-    m.send_at(&submit, 1);
-    std::thread::sleep(Duration::from_millis(20));
-    assert_eq!(m.control.take_used(), None, "a context fence holds its command");
-    assert_eq!(state.lock().unwrap().context_fences, [(1, 3, 41)]);
+    submit_venus_fence(&mut m, 1, 3, 41, 1);
+    submit_venus_fence(&mut m, 1, 4, 42, 2);
+    submit_venus_fence(&mut m, 2, 3, 43, 3);
+    submit_venus_fence(&mut m, 1, 3, 44, 4);
+    let start = Instant::now();
+    while state.lock().unwrap().context_fences.len() != 4 {
+        assert!(start.elapsed() < Duration::from_secs(5), "Venus fences were not submitted");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        state.lock().unwrap().context_fences,
+        vec![(1, 3, 41), (1, 4, 42), (2, 3, 43), (1, 3, 44)]
+    );
 
+    // A completion on context 1/ring 3 retires only that timeline, through 44.
     state.lock().unwrap().retired_context_fences.push(ContextFence {
         context: 1,
         ring_idx: 3,
-        fence: 41,
+        fence: 44,
     });
-    m.gpu.notify(0);
     assert!(wait_used(&mut m.control).is_some());
+    assert!(wait_used(&mut m.control).is_some());
+    assert_eq!(m.control.take_used(), None, "other timelines remain pending");
+
+    state.lock().unwrap().retired_context_fences.push(ContextFence {
+        context: 1,
+        ring_idx: 4,
+        fence: 42,
+    });
+    assert!(wait_used(&mut m.control).is_some());
+    assert_eq!(m.control.take_used(), None);
+
+    state.lock().unwrap().retired_context_fences.push(ContextFence {
+        context: 2,
+        ring_idx: 3,
+        fence: 43,
+    });
+    assert!(wait_used(&mut m.control).is_some());
+    assert_eq!(m.control.take_used(), None);
+}
+
+#[test]
+fn venus_host_blob_maps_and_scans_out() {
+    let pixels = vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255];
+    let state = Arc::new(Mutex::new(FakeState {
+        map_data: pixels.clone(),
+        ..FakeState::default()
+    }));
+    let fake = state.clone();
+    let host = Arc::new(TestHostVisibleMemory::new(HOST_VISIBLE_BASE, HOST_VISIBLE_SIZE));
+    let host_check = host.clone();
+    let mut m = machine_with_host_visible(
+        Some(Box::new(move || Ok(Box::new(Fake(fake)) as Box<dyn Renderer>))),
+        host,
+    );
+    assert_ne!(m.gpu.features & F_RESOURCE_BLOB, 0);
+    assert_ne!(m.gpu.features & F_BLOB_ALIGNMENT, 0);
+
+    let mut create = header(CMD_RESOURCE_CREATE_BLOB, 0, 0);
+    create.extend(words(&[11, 2, 1, 0]));
+    create.extend(0x1234u64.to_le_bytes());
+    create.extend(16_384u64.to_le_bytes());
+    let answer = m.send(&create);
+    assert_eq!(u32::from_le_bytes(answer[0..4].try_into().unwrap()), RESP_OK_NODATA);
+
+    let mut map = header(CMD_RESOURCE_MAP_BLOB, 0, 0);
+    map.extend(words(&[11, 0]));
+    map.extend(0u64.to_le_bytes());
+    let answer = m.send(&map);
+    assert_eq!(u32::from_le_bytes(answer[0..4].try_into().unwrap()), RESP_OK_MAP_INFO);
+    assert_eq!(
+        u32::from_le_bytes(answer[HEADER..HEADER + 4].try_into().unwrap()),
+        1
+    );
+
+    m.send_ok(
+        CMD_SET_SCANOUT_BLOB,
+        &[0, 0, 2, 2, 0, 11, 2, 2, format::R8G8B8A8, 0, 8, 0, 0, 0, 0, 0, 0, 0],
+    );
+    m.send_ok(CMD_RESOURCE_FLUSH, &[0, 0, 2, 2, 11, 0]);
+    assert_eq!(m.frame(1).3, pixels);
+    m.send_ok(CMD_RESOURCE_UNMAP_BLOB, &[11, 0]);
+    assert!(host_check.mappings.lock().unwrap().is_empty());
+    m.send_ok(CMD_RESOURCE_UNREF, &[11]);
+    assert_eq!(state.lock().unwrap().blobs[0].memory, 2);
+}
+
+#[test]
+fn venus_default_blob_can_attach_and_detach_backing_later() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let fake = state.clone();
+    let host = Arc::new(TestHostVisibleMemory::new(HOST_VISIBLE_BASE, HOST_VISIBLE_SIZE));
+    let mut m = machine_with_host_visible(
+        Some(Box::new(move || Ok(Box::new(Fake(fake)) as Box<dyn Renderer>))),
+        host,
+    );
+
+    let mut create = header(CMD_RESOURCE_CREATE_BLOB, 0, 0);
+    create.extend(words(&[12, 3, 0, 0]));
+    create.extend(0x5678u64.to_le_bytes());
+    create.extend(16_384u64.to_le_bytes());
+    let answer = m.send(&create);
+    assert_eq!(u32::from_le_bytes(answer[0..4].try_into().unwrap()), RESP_OK_NODATA);
+
+    let mut attach = header(CMD_RESOURCE_ATTACH_BACKING, 0, 0);
+    attach.extend(words(&[12, 1]));
+    attach.extend((DATA + 0x20_000).to_le_bytes());
+    attach.extend(words(&[16_384, 0]));
+    let answer = m.send(&attach);
+    assert_eq!(u32::from_le_bytes(answer[0..4].try_into().unwrap()), RESP_OK_NODATA);
+    m.send_ok(CMD_RESOURCE_DETACH_BACKING, &[12, 0]);
+    m.send_ok(CMD_RESOURCE_UNREF, &[12]);
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.blobs[0].memory, 3);
+    assert_eq!(state.attached, vec![12]);
+    assert_eq!(state.detached, vec![12]);
 }

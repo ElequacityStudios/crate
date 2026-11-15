@@ -8,11 +8,11 @@
 //! commands: capability sets, contexts, 3D resources, transfers, command
 //! submission and fences, plus host-visible blobs and blob scanout.
 //!
-//! Every command runs on the device's own thread, the GPU thread, which owns
-//! the renderer (a GL context is current on one thread). A vCPU's notify only
-//! wakes it. Commands with a fence answer once the renderer has retired the
-//! fence, in order, since the guest takes an answered fence as every earlier
-//! one done.
+//! Renderer calls run on the device's GPU thread (a GL context is current on
+//! one thread). Venus may invoke fence callbacks from its render-server worker;
+//! those callbacks only enqueue completions through synchronized queues.
+//! Global fences retire in submission order; Venus fences retire independently
+//! on each context/ring timeline. The worker polls both while work is pending.
 //!
 //! What the scanout shows reaches a `DisplaySink` as frames, R, G, B, A, the
 //! cursor drawn in. A flush makes a frame only while the sink is active;
@@ -300,8 +300,13 @@ impl Gpu {
                         None
                     }
                 });
-                let capsets = renderer.as_ref().map(|r| r.capsets()).unwrap_or_default();
+                let mut capsets = renderer.as_ref().map(|r| r.capsets()).unwrap_or_default();
                 let renderer_blob = renderer.as_ref().filter(|r| r.supports_blob());
+                // Venus needs both renderer blob support and the guest-visible host
+                // memory window. Never expose capset 4 without the complete blob path.
+                if renderer_blob.is_none() || worker_host_visible_memory.is_none() {
+                    capsets.retain(|capset| capset.id != CAPSET_VENUS);
+                }
                 let blob_alignment = renderer_blob
                     .map(|r| r.blob_alignment())
                     .unwrap_or(0)
@@ -332,6 +337,7 @@ impl Gpu {
                     scanouts: vec![Scanout::default(); SCANOUTS as usize],
                     fenced: VecDeque::new(),
                     context_fenced: VecDeque::new(),
+                    context_init_enabled: false,
                     trace: std::env::var_os("CRATE_GPU_TRACE").is_some(),
                 };
                 worker.run();
@@ -628,6 +634,7 @@ struct Worker {
     scanouts: Vec<Scanout>,
     fenced: VecDeque<Fenced>,
     context_fenced: VecDeque<FencedContext>,
+    context_init_enabled: bool,
     /// CRATE_GPU_TRACE: log every control command.
     trace: bool,
 }
@@ -653,19 +660,20 @@ impl Worker {
                     {
                         break;
                     }
-                    if self.fenced.is_empty() && plug_by.is_none() {
+                    let has_fences = !self.fenced.is_empty() || !self.context_fenced.is_empty();
+                    if !has_fences && plug_by.is_none() {
                         w = self.shared.wake.wait(w).unwrap();
                         continue;
                     }
                     let mut wait = plug_by.map_or(FENCE_POLL, |by| {
                         by.saturating_duration_since(Instant::now())
                     });
-                    if !self.fenced.is_empty() {
+                    if has_fences {
                         wait = wait.min(FENCE_POLL);
                     }
                     let (guard, waited) = self.shared.wake.wait_timeout(w, wait).unwrap();
                     w = guard;
-                    if waited.timed_out() && !self.fenced.is_empty() {
+                    if waited.timed_out() && has_fences {
                         break;
                     }
                 }
@@ -703,6 +711,7 @@ impl Worker {
     }
 
     fn activate(&mut self, activation: Activation) {
+        self.context_init_enabled = activation.features & F_CONTEXT_INIT != 0;
         let mut queues = activation.queues.into_iter();
         self.control = queues.next();
         self.cursor = queues.next();
@@ -716,6 +725,7 @@ impl Worker {
         self.interrupt = None;
         self.fenced.clear();
         self.context_fenced.clear();
+        self.context_init_enabled = false;
         if let Some(memory) = &self.host_visible_memory {
             for resource in self.resources.values() {
                 if let Kind::Blob { mapped: Some(offset), .. } = &resource.kind {
@@ -775,6 +785,13 @@ impl Worker {
                 used |= self.complete(&chain, &answer);
                 continue;
             };
+            if request.flags & FLAG_INFO_RING_IDX != 0
+                && (!self.context_init_enabled || !request.fenced())
+            {
+                let answer = request.answer(RESP_ERR_INVALID_PARAMETER, &[]);
+                used |= self.complete(&chain, &answer);
+                continue;
+            }
             let mut answer = self.command(&request);
             if request.fenced() {
                 if request.flags & FLAG_INFO_RING_IDX != 0 {
@@ -806,7 +823,7 @@ impl Worker {
                 } else {
                     let fenced = match &mut self.renderer {
                         Some(renderer) => renderer
-                            .create_fence(request.fence, request.context)
+                            .create_fence(request.fence, 0)
                             .map_err(|e| warn!("virtio-gpu: fence {}: {e}", request.fence))
                             .is_ok(),
                         None => false,
@@ -1081,7 +1098,7 @@ impl Worker {
             || flags & !0x7 != 0
             || count > MAX_BACKING_ENTRIES
             || (memory_kind == 2 && count != 0)
-            || (memory_kind != 2 && count == 0)
+            || (memory_kind == 1 && count == 0)
             || self.blob_alignment != 0 && size % self.blob_alignment as u64 != 0
         {
             return Err(RESP_ERR_INVALID_PARAMETER);
@@ -1403,6 +1420,8 @@ impl Worker {
         if !format::supported(format)
             || width == 0
             || height == 0
+            || width > MAX_DIMENSION
+            || height > MAX_DIMENSION
             || stride < width.checked_mul(4).ok_or(RESP_ERR_INVALID_PARAMETER)?
             || stride % 4 != 0
             || r.u32(36) != 0
@@ -1419,8 +1438,17 @@ impl Worker {
                 (*memory, *size, mapped.is_some(), *backing_len),
             _ => return Err(RESP_ERR_INVALID_PARAMETER),
         };
+        let last_row = (rect.y as u64)
+            .checked_add(rect.height as u64 - 1)
+            .and_then(|row| row.checked_mul(stride as u64))
+            .ok_or(RESP_ERR_INVALID_PARAMETER)?;
+        let right = (rect.x as u64)
+            .checked_add(rect.width as u64)
+            .and_then(|x| x.checked_mul(4))
+            .ok_or(RESP_ERR_INVALID_PARAMETER)?;
         let end = (offset as u64)
-            .checked_add(stride as u64 * height as u64)
+            .checked_add(last_row)
+            .and_then(|value| value.checked_add(right))
             .ok_or(RESP_ERR_INVALID_PARAMETER)?;
         if end > size || (memory_kind == 1 && end > backing_len as u64)
             || (memory_kind != 1 && !mapped)
@@ -1534,17 +1562,35 @@ impl Worker {
                     warn!("virtio-gpu: reading resource {}: {e}", scanout.resource);
                 }
             }
-            Kind::Blob { memory, mapped, backing, .. } => {
+            Kind::Blob { memory, size, mapped, backing, backing_len, .. } => {
                 let Some(blob) = scanout.blob else { return };
                 for line in 0..area.height as usize {
-                    let source_offset = blob.offset
-                        .checked_add((area.y as u64 + line as u64) * blob.stride as u64)
-                        .and_then(|n| n.checked_add(area.x as u64 * 4));
-                    let Some(source_offset) = source_offset else { return };
+                    let Some(source_y) = (area.y as u64).checked_add(line as u64) else {
+                        return;
+                    };
+                    let Some(source_offset) = source_y
+                        .checked_mul(blob.stride as u64)
+                        .and_then(|value| value.checked_add(blob.offset))
+                        .and_then(|value| value.checked_add((area.x as u64).checked_mul(4)?))
+                    else {
+                        return;
+                    };
+                    let Some(source_end) = source_offset.checked_add(row as u64) else {
+                        return;
+                    };
+                    if source_end > *size {
+                        return;
+                    }
                     let to = start + line * stride;
                     let out = &mut scanout.screen[to..to + row];
                     if *memory == 1 {
-                        copy_from_backing(backing, source_offset as usize, out);
+                        if source_end > *backing_len as u64 {
+                            return;
+                        }
+                        let Ok(source_offset) = usize::try_from(source_offset) else {
+                            return;
+                        };
+                        copy_from_backing(backing, source_offset, out);
                     } else {
                         let Some(mapped_offset) = mapped else { return };
                         let Some(host_memory) = &self.host_visible_memory else { return };
@@ -1702,17 +1748,42 @@ impl Worker {
 
     fn attach_backing(&mut self, r: &Request) -> Result<(), u32> {
         let id = r.u32(0);
-        if !self.resources.contains_key(&id) {
+        let Some(resource) = self.resources.get(&id) else {
             return Err(RESP_ERR_INVALID_RESOURCE_ID);
-        }
+        };
+        let blob_size = match &resource.kind {
+            Kind::Blob { memory, size, backing_len, .. } => {
+                if *memory != 3 || *backing_len != 0 {
+                    return Err(RESP_ERR_INVALID_PARAMETER);
+                }
+                Some(*size)
+            }
+            _ => None,
+        };
         let (pieces, total) = self.backing_pieces(r)?;
+        if let Some(size) = blob_size {
+            if total as u64 < size {
+                return Err(RESP_ERR_INVALID_PARAMETER);
+            }
+            let renderer = self.renderer.as_mut().ok_or(RESP_ERR_UNSPEC)?;
+            let slices = pieces.iter().map(|p| p.slice).collect();
+            // SAFETY: guest RAM stays mapped for the machine's life, which
+            // the renderer, owned by this device, does not outlive.
+            unsafe { renderer.attach_backing(id, slices) }
+                .map_err(|_| RESP_ERR_INVALID_PARAMETER)?;
+            let Some(Resource { kind: Kind::Blob { backing, backing_len, .. }, .. }) =
+                self.resources.get_mut(&id)
+            else {
+                unreachable!("resource kind changed while attaching backing");
+            };
+            *backing = pieces;
+            *backing_len = total;
+            return Ok(());
+        }
+
         let resource = self.resources.get_mut(&id).unwrap();
         match &mut resource.kind {
-            Kind::Simple {
-                backing,
-                backing_len,
-                ..
-            } => {
+            Kind::Simple { backing, backing_len, .. } => {
                 *backing = pieces;
                 *backing_len = total;
                 Ok(())
@@ -1748,7 +1819,15 @@ impl Worker {
                     renderer.detach_backing(id);
                 }
             }
-            Kind::Blob { .. } => return Err(RESP_ERR_INVALID_PARAMETER),
+            Kind::Blob { memory, backing, backing_len, .. } => {
+                if *memory != 3 || *backing_len == 0 {
+                    return Err(RESP_ERR_INVALID_PARAMETER);
+                }
+                let renderer = self.renderer.as_mut().ok_or(RESP_ERR_UNSPEC)?;
+                renderer.detach_backing(id);
+                backing.clear();
+                *backing_len = 0;
+            }
         }
         Ok(())
     }
@@ -1762,16 +1841,25 @@ impl Worker {
         };
         match r.kind {
             CMD_CTX_CREATE => {
-                let len = (r.u32(0) as usize).min(64);
-                let context_init = if self.capsets.iter().any(|capset| capset.id == CAPSET_VENUS) {
-                    r.u32(4)
+                let len = r.u32(0) as usize;
+                if len > 64 {
+                    return Err(RESP_ERR_INVALID_PARAMETER);
+                }
+                let (context_init, name_offset) = if self.context_init_enabled {
+                    let raw = r.u32(4);
+                    if raw & !0xff != 0 {
+                        return Err(RESP_ERR_INVALID_PARAMETER);
+                    }
+                    (raw, 8)
                 } else {
-                    0
+                    (0, 4)
                 };
                 if context_init != 0 && !self.capsets.iter().any(|capset| capset.id == context_init) {
                     return Err(RESP_ERR_INVALID_CONTEXT_ID);
                 }
-                let name = r.body.get(8..8 + len).unwrap_or(&[]);
+                let Some(name) = r.body.get(name_offset..name_offset + len) else {
+                    return Err(RESP_ERR_INVALID_PARAMETER);
+                };
                 renderer
                     .create_context(r.context, context_init, name)
                     .map_err(|e| failed("creating a context", e))

@@ -7,9 +7,11 @@
 //! command streams, resources the guest names by number, fences that retire
 //! in the order they were made).
 //!
-//! A renderer belongs to one thread, the GPU's: a GL context is current on one
-//! thread at a time, so the device makes the renderer there (`RendererFactory`)
-//! and calls it from nowhere else.
+//! Renderer methods belong to one thread, the GPU's: a GL context is current
+//! on one thread at a time, so the device makes the renderer there
+//! (`RendererFactory`) and calls it from nowhere else. A Venus render-server
+//! worker may deliver fence callbacks from another thread; implementations
+//! must make those callback queues thread-safe.
 
 use std::os::fd::OwnedFd;
 
@@ -167,8 +169,9 @@ pub trait Renderer {
     /// Runs a context's command stream.
     fn submit(&mut self, context: u32, commands: &mut [u32]) -> RendererResult<()>;
 
-    /// A fence after everything submitted so far. Fences retire in the order
-    /// they were made.
+    /// A global fence after everything submitted so far. Global fences retire
+    /// in submission order; Venus uses create_context_fence for context/ring
+    /// timelines instead.
     fn create_fence(&mut self, fence: u64, context: u32) -> RendererResult<()>;
     /// Creates a fence on a specific context timeline (Venus uses ring indices).
     fn create_context_fence(

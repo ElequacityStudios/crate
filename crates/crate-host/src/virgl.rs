@@ -15,9 +15,9 @@
 //! back end is `CRATE_ANGLE_PLATFORM` (vulkan, metal or default), or ANGLE's
 //! own `ANGLE_DEFAULT_PLATFORM` when that is set.
 //!
-//! Everything here runs on the GPU's thread, which made the renderer:
-//! virglrenderer calls back into this module for its GL contexts and fences on
-//! that thread, from inside the calls made to it.
+//! Renderer API calls and GL-context callbacks run on the GPU's thread.
+//! When Venus uses virglrenderer's render server, fence callbacks can arrive
+//! on its worker thread; they only append to mutex-protected completion queues.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
@@ -183,7 +183,7 @@ impl BlobFunctions {
 
 /// A library opened with dlopen, closed never: its functions may still be
 /// on some thread's stack, and libraries like these do not unload cleanly.
-struct Library(*mut c_void);
+struct Library { handle: *mut c_void, name: String }
 
 impl Library {
     fn open(names: &[String]) -> Result<Library> {
@@ -196,7 +196,7 @@ impl Library {
             let handle = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
             if !handle.is_null() {
                 debug!("virgl: loaded {name}");
-                return Ok(Library(handle));
+                return Ok(Library { handle, name: name.clone() });
             }
             // SAFETY: dlerror returns NULL or a message valid until the next call.
             let why = unsafe { libc::dlerror() };
@@ -219,7 +219,7 @@ impl Library {
     fn symbol(&self, name: &str) -> Result<*mut c_void> {
         let c = CString::new(name).unwrap();
         // SAFETY: a handle from dlopen and a valid string.
-        let f = unsafe { libc::dlsym(self.0, c.as_ptr()) };
+        let f = unsafe { libc::dlsym(self.handle, c.as_ptr()) };
         if f.is_null() {
             Err(Error::Unsupported(format!("{name} is missing")))
         } else {
@@ -555,6 +555,7 @@ struct Inner {
     blobs: Option<BlobFunctions>,
     context_create_with_flags: Option<ContextCreateWithFlags>,
     context_create_fence: Option<ContextCreateFence>,
+    venus_enabled: bool,
     /// Fences made and not yet retired, oldest first.
     fences: VecDeque<u64>,
     _libraries: [Library; 2],
@@ -565,6 +566,10 @@ impl Inner {
     fn start() -> Result<Self> {
         let egl_library = Library::open(&library_names("CRATE_EGL", EGL_NAMES))?;
         let virgl_library = Library::open(&library_names("CRATE_VIRGLRENDERER", VIRGL_NAMES))?;
+        let venus_enabled = virgl_library.name.contains("virglrenderer.venus");
+        if venus_enabled {
+            info!("virglrenderer: Venus Vulkan backend selected");
+        }
         let egl = EglFunctions::load(|name| egl_library.symbol(name))?;
         let virgl = VirglFunctions::load(|name| virgl_library.symbol(name))?;
         let blobs = BlobFunctions::load(&virgl_library);
@@ -685,12 +690,12 @@ impl Inner {
         let cookie = &*gl as *const Gl as *mut c_void;
         // SAFETY: the cookie and callbacks are boxed and live as long as the
         // renderer, which cleans up before dropping them.
+        let mut renderer_flags = VIRGL_RENDERER_USE_GLES;
+        if venus_enabled {
+            renderer_flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;
+        }
         let status = unsafe {
-            (virgl.virgl_renderer_init)(
-                cookie,
-                VIRGL_RENDERER_USE_GLES | VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER,
-                &mut *callbacks,
-            )
+            (virgl.virgl_renderer_init)(cookie, renderer_flags, &mut *callbacks)
         };
         if status != 0 {
             gl.make_current(ptr::null_mut());
@@ -706,22 +711,27 @@ impl Inner {
             framebuffer,
             gl,
             _callbacks: callbacks,
-            description: format!("virglrenderer, ANGLE {platform}: {renderer}, {version}"),
+            description: format!(
+                "virglrenderer{}; ANGLE {platform}: {renderer}, {version}",
+                if venus_enabled { " + Venus" } else { "" }
+            ),
             backings: HashMap::new(),
             blob_backings: HashMap::new(),
             blobs,
             context_create_with_flags,
             context_create_fence,
+            venus_enabled,
             fences: VecDeque::new(),
             _libraries: [egl_library, virgl_library],
         })
     }
 
     fn detach(&mut self, resource: u32) {
-        if self.backings.contains_key(&resource) {
+        if self.backings.contains_key(&resource) || self.blob_backings.contains_key(&resource) {
             let (mut iov, mut count) = (ptr::null_mut(), 0);
-            // SAFETY: the resource has the backing this module attached,
-            // freed below once virglrenderer has let go of it.
+            // SAFETY: the resource has the backing this module attached (or
+            // supplied to resource_create_blob); virglrenderer lets go before
+            // the owned iovec arrays are dropped below.
             unsafe {
                 (self.virgl.virgl_renderer_resource_detach_iov)(
                     resource as c_int,
@@ -730,6 +740,7 @@ impl Inner {
                 )
             };
             self.backings.remove(&resource);
+            self.blob_backings.remove(&resource);
         }
     }
 }
@@ -1063,7 +1074,9 @@ impl Inner {
             .iter()
             .filter_map(|&id| {
                 if id == CAPSET_VENUS
-                    && (self.context_create_with_flags.is_none() || self.context_create_fence.is_none())
+                    && (!self.venus_enabled
+                        || self.context_create_with_flags.is_none()
+                        || self.context_create_fence.is_none())
                 {
                     return None;
                 }
@@ -1114,6 +1127,7 @@ impl Inner {
             // contexts, including Venus (capset 4).
             unsafe { create(context, context_init, name.len() as u32, name.as_ptr().cast()) }
         } else {
+            self.gl.restore(previous);
             return Err("virglrenderer does not support context_init".into());
         };
         self.gl.restore(previous);
@@ -1161,7 +1175,6 @@ impl Inner {
 
     fn destroy_resource(&mut self, resource: u32) {
         self.detach(resource);
-        self.blob_backings.remove(&resource);
         // SAFETY: virglrenderer checks the id.
         unsafe { (self.virgl.virgl_renderer_resource_unref)(resource) };
     }
@@ -1247,11 +1260,12 @@ impl Inner {
         status("submit_cmd", code)
     }
 
-    fn create_fence(&mut self, fence: u64, context: u32) -> RendererResult<()> {
-        // virglrenderer's fences are 32 bits; poll matches them back up.
+    fn create_fence(&mut self, fence: u64, _context: u32) -> RendererResult<()> {
+        // Legacy/global fences belong to context zero. Venus timelines use
+        // create_context_fence instead.
         // SAFETY: a plain call.
         let code =
-            unsafe { (self.virgl.virgl_renderer_create_fence)(fence as u32 as c_int, context) };
+            unsafe { (self.virgl.virgl_renderer_create_fence)(fence as u32 as c_int, 0) };
         status("create_fence", code)?;
         self.fences.push_back(fence);
         Ok(())
@@ -1390,7 +1404,12 @@ impl Inner {
     }
 
     fn reset(&mut self) {
-        let resources: Vec<u32> = self.backings.keys().copied().collect();
+        let resources: Vec<u32> = self
+            .backings
+            .keys()
+            .chain(self.blob_backings.keys())
+            .copied()
+            .collect();
         for resource in resources {
             self.detach(resource);
         }
@@ -1399,5 +1418,11 @@ impl Inner {
         self.gl.retired_context.lock().unwrap().clear();
         // SAFETY: a plain call.
         unsafe { (self.virgl.virgl_renderer_reset)() };
+        // The render-server worker may have completed callbacks while reset
+        // was in progress; none of those fences belong to the new VM state.
+        self.gl.retired.lock().unwrap().clear();
+        self.gl.retired_context.lock().unwrap().clear();
+        self.backings.clear();
+        self.blob_backings.clear();
     }
 }
