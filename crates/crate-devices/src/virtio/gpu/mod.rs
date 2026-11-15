@@ -1762,7 +1762,7 @@ impl Worker {
         };
         let (pieces, total) = self.backing_pieces(r)?;
         if let Some(size) = blob_size {
-            if total as u64 < size {
+            if (total as u64) < size {
                 return Err(RESP_ERR_INVALID_PARAMETER);
             }
             let renderer = self.renderer.as_mut().ok_or(RESP_ERR_UNSPEC)?;
