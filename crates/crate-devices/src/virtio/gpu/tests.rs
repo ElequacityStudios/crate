@@ -8,7 +8,7 @@ use std::time::Instant;
 use super::super::queue::QueueConfig;
 use super::super::queue::testing::*;
 use super::*;
-use crate_core::gpu::RendererResult;
+use crate_core::gpu::{ContextFence, RendererResult};
 use crate_core::irq::{IrqLine, LevelRecorder};
 
 const CURSOR_RINGS: u64 = RAM_BASE + 0x4000;
@@ -428,6 +428,9 @@ struct FakeState {
     fences: Vec<u64>,
     retire: usize,
     submitted: Vec<u32>,
+    contexts: Vec<(u32, u32)>,
+    context_fences: Vec<(u32, u32, u64)>,
+    retired_context_fences: Vec<ContextFence>,
 }
 
 struct Fake(Arc<Mutex<FakeState>>);
@@ -437,17 +440,38 @@ impl Renderer for Fake {
         "fake".into()
     }
     fn capsets(&self) -> Vec<Capset> {
-        vec![Capset {
-            id: 1,
-            max_version: 1,
-            max_size: 8,
-        }]
+        vec![
+            Capset {
+                id: 1,
+                max_version: 1,
+                max_size: 8,
+            },
+            Capset {
+                id: 4,
+                max_version: 1,
+                max_size: 32,
+            },
+        ]
     }
     fn fill_capset(&mut self, _id: u32, _version: u32, out: &mut [u8]) {
         out.fill(0xcc);
     }
-    fn create_context(&mut self, _context: u32, _context_init: u32, _name: &[u8]) -> RendererResult<()> {
+    fn create_context(&mut self, context: u32, context_init: u32, _name: &[u8]) -> RendererResult<()> {
+        self.0.lock().unwrap().contexts.push((context, context_init));
         Ok(())
+    }
+    fn create_context_fence(
+        &mut self,
+        context: u32,
+        _flags: u32,
+        ring_idx: u32,
+        fence: u64,
+    ) -> RendererResult<()> {
+        self.0.lock().unwrap().context_fences.push((context, ring_idx, fence));
+        Ok(())
+    }
+    fn poll_context_fences(&mut self) -> Vec<ContextFence> {
+        std::mem::take(&mut self.0.lock().unwrap().retired_context_fences)
     }
     fn destroy_context(&mut self, _context: u32) {}
     fn attach_resource(&mut self, _context: u32, _resource: u32) {}
@@ -500,7 +524,7 @@ fn answers_fences_once_the_renderer_retires_them() {
     assert!(m.gpu.has_3d());
     let mut capsets = [0u8; 4];
     m.gpu.read_config(12, &mut capsets);
-    assert_eq!(u32::from_le_bytes(capsets), 1);
+    assert_eq!(u32::from_le_bytes(capsets), 2);
 
     let mut r = header(CMD_GET_CAPSET, 0, 0);
     r.extend(words(&[1, 1]));
@@ -554,4 +578,38 @@ fn a_reset_forgets_everything() {
     m.control = Driver::new(m.memory.clone(), 16);
     m.memory.fill(RAM_BASE, 0x3000, 0).unwrap();
     m.send_ok(CMD_RESOURCE_CREATE_2D, &[1, format::B8G8R8X8, 4, 4]);
+}
+
+#[test]
+fn venus_context_init_and_timeline_fences_are_forwarded() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let fake = state.clone();
+    let mut m = machine(Some(Box::new(move || {
+        Ok(Box::new(Fake(fake)) as Box<dyn Renderer>)
+    })));
+    assert_ne!(m.gpu.features & F_CONTEXT_INIT, 0);
+
+    let mut create = header(CMD_CTX_CREATE, 0, 0);
+    create[16..20].copy_from_slice(&1u32.to_le_bytes());
+    create.extend(words(&[0, CAPSET_VENUS]));
+    let answer = m.send(&create);
+    assert_eq!(u32::from_le_bytes(answer[0..4].try_into().unwrap()), RESP_OK_NODATA);
+    assert_eq!(state.lock().unwrap().contexts, [(1, CAPSET_VENUS)]);
+
+    let mut submit = header(CMD_SUBMIT_3D, FLAG_FENCE | FLAG_INFO_RING_IDX, 41);
+    submit[16..20].copy_from_slice(&1u32.to_le_bytes());
+    submit[20] = 3;
+    submit.extend(words(&[4, 0, 0xfeed]));
+    m.send_at(&submit, 1);
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(m.control.take_used(), None, "a context fence holds its command");
+    assert_eq!(state.lock().unwrap().context_fences, [(1, 3, 41)]);
+
+    state.lock().unwrap().retired_context_fences.push(ContextFence {
+        context: 1,
+        ring_idx: 3,
+        fence: 41,
+    });
+    m.gpu.notify(0);
+    assert!(wait_used(&mut m.control).is_some());
 }
