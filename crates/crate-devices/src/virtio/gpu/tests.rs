@@ -446,7 +446,7 @@ impl Renderer for Fake {
     fn fill_capset(&mut self, _id: u32, _version: u32, out: &mut [u8]) {
         out.fill(0xcc);
     }
-    fn create_context(&mut self, _context: u32, _name: &[u8]) -> RendererResult<()> {
+    fn create_context(&mut self, _context: u32, _context_init: u32, _name: &[u8]) -> RendererResult<()> {
         Ok(())
     }
     fn destroy_context(&mut self, _context: u32) {}
