@@ -81,6 +81,8 @@ pub struct InputConfig {
     pub keyboard: bool,
     /// An absolute pointer.
     pub tablet: bool,
+    /// A relative mouse.
+    pub mouse: bool,
 }
 
 /// The modes a display offers unless told otherwise: the preferred first.
@@ -292,6 +294,12 @@ impl VirtMachine {
             tablet = Some(device.sender());
             devices.push(Box::new(device));
         }
+        let mut mouse = None;
+        if config.input.mouse {
+            let device = Input::new(InputKind::Mouse, "crate mouse");
+            mouse = Some(device.sender());
+            devices.push(Box::new(device));
+        }
         let virtio_count = devices.len();
         for (slot, device) in devices.into_iter().enumerate() {
             let irq = IrqLine::new(lines.clone(), VIRTIO_SPI_BASE + slot as u32);
@@ -343,7 +351,7 @@ impl VirtMachine {
             board,
             consoles,
             displays,
-            input: Arc::new(Inputs::new(keyboard, tablet)),
+            input: Arc::new(Inputs::new(keyboard, tablet, mouse)),
             dtb,
             _ram: ram,
         })

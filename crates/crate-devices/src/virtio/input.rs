@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! virtio-input (VIRTIO 1.2, section 5.8): a keyboard and an absolute tablet,
-//! each its own device, passing Linux input events (type, code, value) to the
+//! virtio-input (VIRTIO 1.2, section 5.8): a keyboard, an absolute tablet and
+//! a relative mouse, each its own device, passing Linux input events (type, code, value) to the
 //! guest's evdev.
 //!
 //! The configuration space answers the driver's questions one at a time: it
@@ -41,6 +41,8 @@ pub const EV_REL: u16 = 0x02;
 pub const EV_ABS: u16 = 0x03;
 pub const EV_REP: u16 = 0x14;
 pub const SYN_REPORT: u16 = 0;
+pub const REL_X: u16 = 0x00;
+pub const REL_Y: u16 = 0x01;
 pub const REL_HWHEEL: u16 = 0x06;
 pub const REL_WHEEL: u16 = 0x08;
 pub const ABS_X: u16 = 0x00;
@@ -60,6 +62,8 @@ pub enum InputKind {
     /// An absolute pointer, 0 to POINTER_MAX on each axis, with three buttons
     /// and both wheels.
     Tablet,
+    /// A relative mouse with three buttons and both wheels.
+    Mouse,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,6 +180,7 @@ impl Input {
                 let product: u16 = match self.kind {
                     InputKind::Keyboard => 1,
                     InputKind::Tablet => 2,
+                    InputKind::Mouse => 3,
                 };
                 [BUS_VIRTUAL, VENDOR, product, 1]
                     .iter()
@@ -206,8 +211,11 @@ impl Input {
             // Any bit: the driver asks only whether the answer is empty, and
             // then the guest repeats held keys itself.
             (InputKind::Keyboard, EV_REP) => vec![0],
-            (InputKind::Tablet, EV_KEY) => vec![BTN_LEFT, BTN_RIGHT, BTN_MIDDLE],
+            (InputKind::Tablet, EV_KEY) | (InputKind::Mouse, EV_KEY) => {
+                vec![BTN_LEFT, BTN_RIGHT, BTN_MIDDLE]
+            }
             (InputKind::Tablet, EV_REL) => vec![REL_HWHEEL, REL_WHEEL],
+            (InputKind::Mouse, EV_REL) => vec![REL_X, REL_Y, REL_HWHEEL, REL_WHEEL],
             (InputKind::Tablet, EV_ABS) => vec![ABS_X, ABS_Y],
             _ => Vec::new(),
         }
@@ -302,19 +310,27 @@ impl VirtioDevice for Input {
     }
 }
 
-/// A keyboard and a tablet behind `InputSink`.
+/// A keyboard, absolute tablet and relative mouse behind `InputSink`.
 pub struct Inputs {
     keyboard: Option<EventSender>,
     tablet: Option<EventSender>,
-    buttons: Mutex<u32>,
+    mouse: Option<EventSender>,
+    tablet_buttons: Mutex<u32>,
+    mouse_buttons: Mutex<u32>,
 }
 
 impl Inputs {
-    pub fn new(keyboard: Option<EventSender>, tablet: Option<EventSender>) -> Self {
+    pub fn new(
+        keyboard: Option<EventSender>,
+        tablet: Option<EventSender>,
+        mouse: Option<EventSender>,
+    ) -> Self {
         Inputs {
             keyboard,
             tablet,
-            buttons: Mutex::new(0),
+            mouse,
+            tablet_buttons: Mutex::new(0),
+            mouse_buttons: Mutex::new(0),
         }
     }
 }
@@ -332,7 +348,7 @@ impl InputSink for Inputs {
         let Some(tablet) = &self.tablet else {
             return;
         };
-        let mut held = self.buttons.lock().unwrap();
+        let mut held = self.tablet_buttons.lock().unwrap();
         let mut events = vec![
             Event::new(EV_ABS, ABS_X, x.min(POINTER_MAX) as i32),
             Event::new(EV_ABS, ABS_Y, y.min(POINTER_MAX) as i32),
@@ -350,8 +366,36 @@ impl InputSink for Inputs {
         tablet.send(&events);
     }
 
+    fn mouse(&self, dx: i32, dy: i32, buttons: u32) {
+        let Some(mouse) = &self.mouse else {
+            return;
+        };
+        let mut held = self.mouse_buttons.lock().unwrap();
+        let mut events = Vec::new();
+        if dx != 0 {
+            events.push(Event::new(EV_REL, REL_X, dx));
+        }
+        if dy != 0 {
+            events.push(Event::new(EV_REL, REL_Y, dy));
+        }
+        for (bit, code) in [
+            (BUTTON_LEFT, BTN_LEFT),
+            (BUTTON_RIGHT, BTN_RIGHT),
+            (BUTTON_MIDDLE, BTN_MIDDLE),
+        ] {
+            if (*held ^ buttons) & bit != 0 {
+                events.push(Event::new(EV_KEY, code, (buttons & bit != 0) as i32));
+            }
+        }
+        *held = buttons;
+        if !events.is_empty() {
+            mouse.send(&events);
+        }
+    }
+
     fn scroll(&self, dx: i32, dy: i32) {
-        let Some(tablet) = &self.tablet else {
+        let device = self.mouse.as_ref().or(self.tablet.as_ref());
+        let Some(device) = device else {
             return;
         };
         let mut events = Vec::new();
@@ -363,7 +407,7 @@ impl InputSink for Inputs {
             events.push(Event::new(EV_REL, REL_HWHEEL, dx));
         }
         if !events.is_empty() {
-            tablet.send(&events);
+            device.send(&events);
         }
     }
 }
@@ -408,13 +452,20 @@ mod tests {
         assert!(!ask(&mut keyboard, CFG_EV_BITS, EV_REP as u8).is_empty());
         assert!(ask(&mut keyboard, CFG_EV_BITS, EV_ABS as u8).is_empty());
         assert!(ask(&mut keyboard, CFG_ABS_INFO, 0).is_empty());
+
+        let mut mouse = Input::new(InputKind::Mouse, "crate mouse");
+        assert_eq!(ask(&mut mouse, CFG_ID_DEVIDS, 0), [6, 0, 0x72, 0x63, 3, 0, 1, 0]);
+        assert_eq!(ask(&mut mouse, CFG_EV_BITS, EV_REL as u8), [0b0100_0011, 0b0000_0001]);
+        let mouse_keys = ask(&mut mouse, CFG_EV_BITS, EV_KEY as u8);
+        assert_eq!(mouse_keys[BTN_LEFT as usize / 8] & 0b111, 0b111);
+        assert!(ask(&mut mouse, CFG_EV_BITS, EV_ABS as u8).is_empty());
     }
 
     #[test]
     fn delivers_events_and_keeps_a_backlog() {
         let memory = memory();
         let mut dev = Input::new(InputKind::Tablet, "t");
-        let inputs = Inputs::new(None, Some(dev.sender()));
+        let inputs = Inputs::new(None, Some(dev.sender()), None);
         inputs.pointer(1, 2, 0);
         dev.activate(Activation {
             memory: memory.clone(),
@@ -454,4 +505,36 @@ mod tests {
         assert_eq!(&rest[0..8], &Event::new(EV_SYN, SYN_REPORT, 0).bytes());
         assert_eq!(&rest[8..16], &Event::new(EV_REL, REL_WHEEL, -1).bytes());
     }
+    #[test]
+    fn delivers_relative_mouse_motion_and_buttons() {
+        let memory = memory();
+        let mut dev = Input::new(InputKind::Mouse, "crate mouse");
+        let inputs = Inputs::new(None, None, Some(dev.sender()));
+        dev.activate(Activation {
+            memory: memory.clone(),
+            queues: vec![
+                Queue::new(memory.clone(), config(8)),
+                Queue::new(memory.clone(), config(8)),
+            ],
+            interrupt: Interrupt::new(IrqLine::new(Arc::new(LevelRecorder::default()), 0)),
+            features: F_VERSION_1,
+        });
+        let mut driver = Driver::new(memory.clone(), 8);
+        for i in 0..4 {
+            driver.offer(&[(DATA + 8 * i, 8, true)]);
+        }
+        inputs.mouse(12, -7, BUTTON_LEFT);
+        let mut bytes = [0u8; 32];
+        memory.read(DATA, &mut bytes).unwrap();
+        let expected = [
+            Event::new(EV_REL, REL_X, 12),
+            Event::new(EV_REL, REL_Y, -7),
+            Event::new(EV_KEY, BTN_LEFT, 1),
+            Event::new(EV_SYN, SYN_REPORT, 0),
+        ];
+        for (i, event) in expected.iter().enumerate() {
+            assert_eq!(&bytes[i * 8..(i + 1) * 8], &event.bytes());
+        }
+    }
+
 }

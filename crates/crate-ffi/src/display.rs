@@ -520,7 +520,7 @@ mod tests {
                 Status::InvalidArgument
             );
             assert_eq!(crate_config_add_input(c, 3), Status::Ok);
-            assert_eq!(crate_config_add_input(c, 4), Status::InvalidArgument);
+            assert_eq!(crate_config_add_input(c, 8), Status::InvalidArgument);
             let config = &*c;
             assert_eq!(config.displays[0].gpu, Gpu::Virgl);
             assert_eq!(config.displays[0].modes[1], Mode::new(1280, 960));

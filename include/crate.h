@@ -300,9 +300,9 @@ crate_status crate_display_set_modes(crate_machine *machine, uint32_t display,
 #define CRATE_INPUT_KEYBOARD (1u << 0)
 #define CRATE_INPUT_TABLET (1u << 1) /* an absolute pointer: positions, not movements */
 
-/* virtio-input devices: a keyboard and a tablet with three buttons and a
-   wheel each way, each its own device. A machine with a display wants both:
-   without input devices the guest ignores the app. */
+/* virtio-input devices: a keyboard, absolute tablet and relative mouse,
+   each its own device. The tablet and mouse each have three buttons and a
+   wheel in each direction. */
 crate_status crate_config_add_input(crate_config *config, uint32_t devices);
 
 /* Keys are Linux input event codes (KEY_A is 30), the guest's own names for them. */

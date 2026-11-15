@@ -235,6 +235,7 @@ fn build(config: &Config) -> Result<(VirtMachine, Vec<Arc<AppDisplay>>), Status>
         input: InputConfig {
             keyboard: config.input & display::INPUT_KEYBOARD != 0,
             tablet: config.input & display::INPUT_TABLET != 0,
+            mouse: config.input & display::INPUT_MOUSE != 0,
         },
     })
     .map_err(fail_with)?;

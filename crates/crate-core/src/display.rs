@@ -118,7 +118,7 @@ pub const BUTTON_MIDDLE: u32 = 1 << 2;
 /// The largest pointer coordinate: 0 to this spans the screen.
 pub const POINTER_MAX: u32 = 32767;
 
-/// Input for the guest's keyboard and tablet.
+/// Input for the guest's keyboard, absolute tablet and relative mouse.
 pub trait InputSink: Send + Sync {
     /// `code` is a Linux input event code (KEY_A is 30).
     fn key(&self, code: u16, down: bool);
