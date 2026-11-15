@@ -131,7 +131,7 @@ pub trait Renderer {
     /// `max_size`.
     fn fill_capset(&mut self, id: u32, version: u32, out: &mut [u8]);
 
-    fn create_context(&mut self, context: u32, name: &[u8]) -> RendererResult<()>;
+    fn create_context(&mut self, context: u32, context_init: u32, name: &[u8]) -> RendererResult<()>;
     fn destroy_context(&mut self, context: u32);
     fn attach_resource(&mut self, context: u32, resource: u32);
     fn detach_resource(&mut self, context: u32, resource: u32);
