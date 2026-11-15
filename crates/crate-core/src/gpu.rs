@@ -11,6 +11,8 @@
 //! thread at a time, so the device makes the renderer there (`RendererFactory`)
 //! and calls it from nowhere else.
 
+use std::os::fd::OwnedFd;
+
 use crate::display::Rect;
 
 /// A span of host memory the renderer may read and write: a piece of guest
@@ -30,10 +32,8 @@ pub struct Capset {
     pub max_size: u32,
 }
 
-/// RESOURCE_CREATE_3D's arguments, as the guest gave them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 /// A virtio-gpu host3D blob passed to the renderer.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BlobResource {
     pub id: u32,
     pub context: u32,
@@ -43,6 +43,8 @@ pub struct BlobResource {
     pub size: u64,
 }
 
+/// RESOURCE_CREATE_3D's arguments, as the guest gave them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Resource3d {
     pub id: u32,
     pub target: u32,
