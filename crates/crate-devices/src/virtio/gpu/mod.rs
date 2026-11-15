@@ -52,7 +52,9 @@ pub const ID_GPU: u32 = 16;
 const F_VIRGL: u64 = 1 << 0;
 const F_EDID: u64 = 1 << 1;
 const F_RESOURCE_BLOB: u64 = 1 << 3;
+const F_CONTEXT_INIT: u64 = 1 << 4;
 const F_BLOB_ALIGNMENT: u64 = 1 << 5;
+const CAPSET_VENUS: u32 = 4;
 
 const EVENT_DISPLAY: u32 = 1 << 0;
 
@@ -309,7 +311,8 @@ impl Gpu {
                 } else {
                     0
                 };
-                let _ = ready.send((capsets.len(), blob_alignment));
+                let supports_context_init = capsets.iter().any(|capset| capset.id == CAPSET_VENUS);
+                let _ = ready.send((capsets.len(), blob_alignment, supports_context_init));
                 let worker = Worker {
                     shared: thread_shared.clone(),
                     sink,
@@ -333,7 +336,7 @@ impl Gpu {
                 thread_shared.reset_done.notify_all();
             })
             .map_err(|e| crate_core::Error::NoMemory(format!("the GPU thread: {e}")))?;
-        let (capset_count, blob_alignment) = started.recv().unwrap_or((0, 0));
+        let (capset_count, blob_alignment, supports_context_init) = started.recv().unwrap_or((0, 0, false));
         let capsets = capset_count as u32;
         let host_visible_region = if blob_alignment != 0 {
             host_visible_memory.as_ref().map(|memory| SharedMemoryRegion {
@@ -346,6 +349,9 @@ impl Gpu {
         let mut features = F_VERSION_1 | F_EDID;
         if capsets > 0 {
             features |= F_VIRGL;
+        }
+        if supports_context_init {
+            features |= F_CONTEXT_INIT;
         }
         if host_visible_region.is_some() {
             features |= F_RESOURCE_BLOB | F_BLOB_ALIGNMENT;
@@ -1576,9 +1582,17 @@ impl Worker {
         match r.kind {
             CMD_CTX_CREATE => {
                 let len = (r.u32(0) as usize).min(64);
+                let context_init = if self.capsets.iter().any(|capset| capset.id == CAPSET_VENUS) {
+                    r.u32(4)
+                } else {
+                    0
+                };
+                if context_init != 0 && !self.capsets.iter().any(|capset| capset.id == context_init) {
+                    return Err(RESP_ERR_INVALID_CONTEXT_ID);
+                }
                 let name = r.body.get(8..8 + len).unwrap_or(&[]);
                 renderer
-                    .create_context(r.context, name)
+                    .create_context(r.context, context_init, name)
                     .map_err(|e| failed("creating a context", e))
                     .map_err(|_| RESP_ERR_INVALID_CONTEXT_ID)
             }
