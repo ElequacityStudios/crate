@@ -1258,8 +1258,7 @@ impl Inner {
         ring_idx: u32,
         fence: u64,
     ) -> RendererResult<()> {
-        let inner = self.inner();
-        let Some(create) = inner.context_create_fence else {
+        let Some(create) = self.context_create_fence else {
             return Err("virglrenderer does not support context fences".into());
         };
         // SAFETY: the context, ring, and fence are guest virtio-gpu values.
@@ -1268,7 +1267,7 @@ impl Inner {
     }
 
     fn poll_context_fences(&mut self) -> Vec<ContextFence> {
-        std::mem::take(&mut *self.inner().gl.retired_context.borrow_mut())
+        std::mem::take(&mut *self.gl.retired_context.borrow_mut())
     }
 
     fn poll(&mut self) -> Vec<u64> {
