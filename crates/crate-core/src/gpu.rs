@@ -32,6 +32,14 @@ pub struct Capset {
     pub max_size: u32,
 }
 
+/// A retired fence on a virtio-gpu context timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextFence {
+    pub context: u32,
+    pub ring_idx: u32,
+    pub fence: u64,
+}
+
 /// A virtio-gpu host3D blob passed to the renderer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BlobResource {
@@ -162,9 +170,23 @@ pub trait Renderer {
     /// A fence after everything submitted so far. Fences retire in the order
     /// they were made.
     fn create_fence(&mut self, fence: u64, context: u32) -> RendererResult<()>;
-    /// Looks for finished work, and returns the fences retired since the last
-    /// call, oldest first.
+    /// Creates a fence on a specific context timeline (Venus uses ring indices).
+    fn create_context_fence(
+        &mut self,
+        _context: u32,
+        _flags: u32,
+        _ring_idx: u32,
+        _fence: u64,
+    ) -> RendererResult<()> {
+        Err("context fences are unsupported".into())
+    }
+    /// Looks for finished work, and returns global fences retired since the
+    /// last call, oldest first.
     fn poll(&mut self) -> Vec<u64>;
+    /// Context/timeline fences retired by the renderer since the last poll.
+    fn poll_context_fences(&mut self) -> Vec<ContextFence> {
+        Vec::new()
+    }
 
     /// Copies `rect` of a 2D resource into `out`, `stride` bytes a row, as
     /// R, G, B, A.
