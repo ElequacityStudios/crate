@@ -64,6 +64,7 @@ fn machine(renderer: Option<RendererFactory>) -> Machine {
         modes: vec![Mode::new(800, 600), Mode::new(640, 480)],
         sink: screen.clone(),
         renderer,
+        host_visible_memory: None,
     })
     .unwrap();
     gpu.activate(Activation {
@@ -323,6 +324,7 @@ fn modes_before_the_driver_starts_need_no_unplug() {
         modes: vec![Mode::new(800, 600)],
         sink: Arc::new(Screen::default()),
         renderer: None,
+        host_visible_memory: None,
     })
     .unwrap();
     gpu.control().set_modes(vec![Mode::new(1024, 768)]);

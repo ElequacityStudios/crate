@@ -15,7 +15,7 @@ use crate_core::warn;
 
 use super::queue::QueueConfig;
 use super::{
-    Activation, F_VERSION_1, Interrupt, Queue, SharedMemoryRegion, STATUS_DRIVER_OK,
+    Activation, F_VERSION_1, Interrupt, Queue, STATUS_DRIVER_OK,
     STATUS_FEATURES_OK, VirtioDevice,
 };
 
@@ -291,6 +291,7 @@ mod tests {
     use super::super::queue::testing::*;
     use super::super::{STATUS_ACKNOWLEDGE, STATUS_DRIVER};
     use super::*;
+    use super::super::SharedMemoryRegion;
     use crate_core::irq::LevelRecorder;
 
     /// A device that echoes each readable buffer into the writable ones.
