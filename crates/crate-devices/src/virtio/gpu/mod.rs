@@ -27,13 +27,14 @@
 //! connection makes it take the new preferred mode.
 
 use std::collections::{HashMap, VecDeque};
+use std::os::fd::AsRawFd;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate_core::display::{DisplayControl, DisplaySink, Frame, Mode, Rect};
-use crate_core::gpu::{Box3d, Capset, HostSlice, Renderer, RendererFactory, Resource3d, Transfer};
+use crate_core::gpu::{BlobResource, Box3d, Capset, HostSlice, Renderer, RendererFactory, Resource3d, Transfer};
 use crate_core::memory::{GuestMemory, HostVisibleMemory};
 use crate_core::{debug, info, warn};
 
@@ -50,6 +51,8 @@ pub const ID_GPU: u32 = 16;
 
 const F_VIRGL: u64 = 1 << 0;
 const F_EDID: u64 = 1 << 1;
+const F_RESOURCE_BLOB: u64 = 1 << 3;
+const F_BLOB_ALIGNMENT: u64 = 1 << 5;
 
 const EVENT_DISPLAY: u32 = 1 << 0;
 
@@ -68,6 +71,7 @@ const CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
 const CMD_GET_CAPSET_INFO: u32 = 0x0108;
 const CMD_GET_CAPSET: u32 = 0x0109;
 const CMD_GET_EDID: u32 = 0x010a;
+const CMD_RESOURCE_CREATE_BLOB: u32 = 0x010c;
 const CMD_CTX_CREATE: u32 = 0x0200;
 const CMD_CTX_DESTROY: u32 = 0x0201;
 const CMD_CTX_ATTACH_RESOURCE: u32 = 0x0202;
@@ -76,6 +80,8 @@ const CMD_RESOURCE_CREATE_3D: u32 = 0x0204;
 const CMD_TRANSFER_TO_HOST_3D: u32 = 0x0205;
 const CMD_TRANSFER_FROM_HOST_3D: u32 = 0x0206;
 const CMD_SUBMIT_3D: u32 = 0x0207;
+const CMD_RESOURCE_MAP_BLOB: u32 = 0x0208;
+const CMD_RESOURCE_UNMAP_BLOB: u32 = 0x0209;
 const CMD_UPDATE_CURSOR: u32 = 0x0300;
 const CMD_MOVE_CURSOR: u32 = 0x0301;
 
@@ -84,6 +90,7 @@ const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const RESP_OK_CAPSET_INFO: u32 = 0x1102;
 const RESP_OK_CAPSET: u32 = 0x1103;
 const RESP_OK_EDID: u32 = 0x1104;
+const RESP_OK_MAP_INFO: u32 = 0x1106;
 const RESP_ERR_UNSPEC: u32 = 0x1200;
 const RESP_ERR_OUT_OF_MEMORY: u32 = 0x1201;
 const RESP_ERR_INVALID_SCANOUT_ID: u32 = 0x1202;
@@ -237,6 +244,7 @@ impl DisplayControl for GpuControl {
 pub struct Gpu {
     features: u64,
     capsets: u32,
+    blob_alignment: u32,
     shared: Arc<Shared>,
     host_visible_region: Option<SharedMemoryRegion>,
     _host_visible_memory: Option<Arc<dyn HostVisibleMemory>>,
@@ -271,13 +279,8 @@ impl Gpu {
         let (ready, started) = mpsc::channel();
         let sink = config.sink;
         let factory = config.renderer;
-        let host_visible_region = config.host_visible_memory.as_ref().map(|memory| {
-            SharedMemoryRegion {
-                addr: memory.guest_addr(),
-                len: memory.len() as u64,
-            }
-        });
         let host_visible_memory = config.host_visible_memory;
+        let worker_host_visible_memory = host_visible_memory.clone();
         let thread_shared = shared.clone();
         let thread = std::thread::Builder::new()
             .name("crate-gpu".into())
@@ -293,13 +296,28 @@ impl Gpu {
                     }
                 });
                 let capsets = renderer.as_ref().map(|r| r.capsets()).unwrap_or_default();
-                let _ = ready.send(capsets.len());
+                let renderer_blob = renderer.as_ref().filter(|r| r.supports_blob());
+                let blob_alignment = renderer_blob
+                    .map(|r| r.blob_alignment())
+                    .unwrap_or(0)
+                    .max(worker_host_visible_memory.as_ref().map(|m| m.alignment()).unwrap_or(0));
+                let blob_alignment = if renderer_blob.is_some()
+                    && worker_host_visible_memory.is_some()
+                    && blob_alignment != 0
+                {
+                    blob_alignment
+                } else {
+                    0
+                };
+                let _ = ready.send((capsets.len(), blob_alignment));
                 let worker = Worker {
                     shared: thread_shared.clone(),
                     sink,
                     renderer,
                     capsets,
                     memory: None,
+                    host_visible_memory: if blob_alignment != 0 { worker_host_visible_memory } else { None },
+                    blob_alignment,
                     control: None,
                     cursor: None,
                     interrupt: None,
@@ -315,17 +333,30 @@ impl Gpu {
                 thread_shared.reset_done.notify_all();
             })
             .map_err(|e| crate_core::Error::NoMemory(format!("the GPU thread: {e}")))?;
-        let capsets = started.recv().unwrap_or(0) as u32;
+        let (capset_count, blob_alignment) = started.recv().unwrap_or((0, 0));
+        let capsets = capset_count as u32;
+        let host_visible_region = if blob_alignment != 0 {
+            host_visible_memory.as_ref().map(|memory| SharedMemoryRegion {
+                addr: memory.guest_addr(),
+                len: memory.len() as u64,
+            })
+        } else {
+            None
+        };
         let mut features = F_VERSION_1 | F_EDID;
         if capsets > 0 {
             features |= F_VIRGL;
         }
+        if host_visible_region.is_some() {
+            features |= F_RESOURCE_BLOB | F_BLOB_ALIGNMENT;
+        }
         Ok(Gpu {
             features,
             capsets,
+            blob_alignment,
             shared,
             host_visible_region,
-            _host_visible_memory: host_visible_memory,
+            _host_visible_memory: if blob_alignment != 0 { host_visible_memory } else { None },
             thread: Some(thread),
         })
     }
@@ -368,10 +399,11 @@ impl VirtioDevice for Gpu {
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
         let events = self.shared.work.lock().unwrap().events;
-        let mut config = [0u8; 16];
+        let mut config = [0u8; 20];
         config[0..4].copy_from_slice(&events.to_le_bytes());
         config[8..12].copy_from_slice(&SCANOUTS.to_le_bytes());
         config[12..16].copy_from_slice(&self.capsets.to_le_bytes());
+        config[16..20].copy_from_slice(&self.blob_alignment.to_le_bytes());
         read_config_bytes(&config, offset, data);
     }
 
@@ -438,6 +470,8 @@ enum Kind {
     },
     /// The renderer's.
     Renderer,
+    /// A virtio-gpu host3D blob; `mapped` is its offset in host-visible RAM.
+    Blob { memory: u32, size: u64, mapped: Option<u64> },
 }
 
 struct Resource {
@@ -560,6 +594,8 @@ struct Worker {
     cursor: Option<Queue>,
     interrupt: Option<Arc<Interrupt>>,
     resources: HashMap<u32, Resource>,
+    host_visible_memory: Option<Arc<dyn HostVisibleMemory>>,
+    blob_alignment: u32,
     bytes_2d: usize,
     scanouts: Vec<Scanout>,
     fenced: VecDeque<Fenced>,
@@ -650,9 +686,18 @@ impl Worker {
         self.cursor = None;
         self.interrupt = None;
         self.fenced.clear();
+        if let Some(memory) = &self.host_visible_memory {
+            for resource in self.resources.values() {
+                if let Kind::Blob { mapped: Some(offset), .. } = &resource.kind {
+                    if let Some(addr) = memory.guest_addr().checked_add(*offset) {
+                        let _ = memory.unmap(addr);
+                    }
+                }
+            }
+        }
         if let Some(renderer) = &mut self.renderer {
             for (&id, resource) in &self.resources {
-                if matches!(resource.kind, Kind::Renderer) {
+                if matches!(resource.kind, Kind::Renderer | Kind::Blob { .. }) {
                     renderer.destroy_resource(id);
                 }
             }
@@ -829,6 +874,7 @@ impl Worker {
                 let (w, h, pixels) = self.renderer.as_mut()?.cursor_image(resource)?;
                 (w, h, pixels, format::B8G8R8A8)
             }
+            Kind::Blob { .. } => return None,
         };
         if pixels.len() < (w * h * 4) as usize {
             return None;
@@ -891,6 +937,18 @@ impl Worker {
                 return r.answer(RESP_OK_CAPSET, &data);
             }
             CMD_RESOURCE_CREATE_2D => self.create_2d(r),
+            CMD_RESOURCE_CREATE_BLOB => self.create_blob(r),
+            CMD_RESOURCE_MAP_BLOB => {
+                return match self.map_blob(r) {
+                    Ok(map_info) => {
+                        let mut data = [0u8; 8];
+                        data[0..4].copy_from_slice(&map_info.to_le_bytes());
+                        r.answer(RESP_OK_MAP_INFO, &data)
+                    }
+                    Err(kind) => err(kind),
+                };
+            }
+            CMD_RESOURCE_UNMAP_BLOB => self.unmap_blob(r.u32(0)),
             CMD_RESOURCE_UNREF => self.unref(r.u32(0)),
             CMD_SET_SCANOUT => self.set_scanout(r),
             CMD_RESOURCE_FLUSH => self.flush(r),
@@ -928,6 +986,189 @@ impl Worker {
             }
         }
         data
+    }
+
+    fn create_blob(&mut self, r: &Request) -> Result<(), u32> {
+        let id = r.u32(0);
+        let memory_kind = r.u32(4);
+        let flags = r.u32(8);
+        let count = r.u32(12);
+        let blob_id = r.u64(16);
+        let size = r.u64(24);
+        if id == 0 || self.resources.contains_key(&id) {
+            return Err(RESP_ERR_INVALID_RESOURCE_ID);
+        }
+        if size == 0
+            || !matches!(memory_kind, 1 | 2 | 3)
+            || flags & !0x7 != 0
+            || count > MAX_BACKING_ENTRIES
+            || (memory_kind == 2 && count != 0)
+            || (memory_kind != 2 && count == 0)
+            || self.blob_alignment != 0 && size % self.blob_alignment as u64 != 0
+        {
+            return Err(RESP_ERR_INVALID_PARAMETER);
+        }
+        let entries_bytes = (count as usize)
+            .checked_mul(16)
+            .ok_or(RESP_ERR_INVALID_PARAMETER)?;
+        if r.body.len() < 32usize.checked_add(entries_bytes).ok_or(RESP_ERR_INVALID_PARAMETER)? {
+            return Err(RESP_ERR_INVALID_PARAMETER);
+        }
+
+        let mut backing = Vec::with_capacity(count as usize);
+        let mut total = 0u64;
+        if count != 0 {
+            let memory = self.memory.as_ref().ok_or(RESP_ERR_UNSPEC)?;
+            for index in 0..count as usize {
+                let at = 32 + index * 16;
+                let address = r.u64(at);
+                let len = r.u32(at + 8) as usize;
+                if len == 0 {
+                    return Err(RESP_ERR_INVALID_PARAMETER);
+                }
+                let ptr = memory
+                    .host_range(address, len as u64)
+                    .map_err(|_| RESP_ERR_INVALID_PARAMETER)?;
+                total = total.checked_add(len as u64).ok_or(RESP_ERR_INVALID_PARAMETER)?;
+                backing.push(HostSlice { ptr, len });
+            }
+            if total < size {
+                return Err(RESP_ERR_INVALID_PARAMETER);
+            }
+        }
+
+        let blob = BlobResource {
+            id,
+            context: r.context,
+            blob_id,
+            memory: memory_kind,
+            flags,
+            size,
+        };
+        let renderer = self.renderer.as_mut().ok_or(RESP_ERR_UNSPEC)?;
+        renderer
+            .create_blob(&blob, &backing)
+            .map_err(|e| {
+                debug!("virtio-gpu: creating blob {id}: {e}");
+                RESP_ERR_INVALID_PARAMETER
+            })?;
+        self.resources.insert(
+            id,
+            Resource {
+                width: 0,
+                height: 0,
+                format: 0,
+                kind: Kind::Blob {
+                    memory: memory_kind,
+                    size,
+                    mapped: None,
+                },
+            },
+        );
+        Ok(())
+    }
+
+    fn map_blob(&mut self, r: &Request) -> Result<u32, u32> {
+        let id = r.u32(0);
+        let offset = r.u64(8);
+        let (memory_kind, size, already_mapped) = match self.resources.get(&id) {
+            Some(Resource {
+                kind: Kind::Blob { memory, size, mapped },
+                ..
+            }) => (*memory, *size, mapped.is_some()),
+            Some(_) => return Err(RESP_ERR_INVALID_PARAMETER),
+            None => return Err(RESP_ERR_INVALID_RESOURCE_ID),
+        };
+        if memory_kind == 1 || already_mapped || self.blob_alignment == 0
+            || offset % self.blob_alignment as u64 != 0
+            || size % self.blob_alignment as u64 != 0
+        {
+            return Err(RESP_ERR_INVALID_PARAMETER);
+        }
+        let memory = self.host_visible_memory.clone().ok_or(RESP_ERR_UNSPEC)?;
+        let end = offset.checked_add(size).ok_or(RESP_ERR_INVALID_PARAMETER)?;
+        if end > memory.len() as u64 {
+            return Err(RESP_ERR_INVALID_PARAMETER);
+        }
+        let guest_addr = memory
+            .guest_addr()
+            .checked_add(offset)
+            .ok_or(RESP_ERR_INVALID_PARAMETER)?;
+        let len = usize::try_from(size).map_err(|_| RESP_ERR_INVALID_PARAMETER)?;
+        let host_addr = memory.reserve(guest_addr, len).map_err(|e| {
+            debug!("virtio-gpu: reserving blob {id} at {offset:#x}: {e}");
+            RESP_ERR_INVALID_PARAMETER
+        })?;
+
+        let renderer = self.renderer.as_mut().ok_or(RESP_ERR_UNSPEC)?;
+        let fixed = match renderer.map_blob_fixed(id, host_addr) {
+            Ok(fixed) => fixed,
+            Err(e) => {
+                let _ = memory.unmap(guest_addr);
+                debug!("virtio-gpu: fixed mapping for blob {id}: {e}");
+                return Err(RESP_ERR_UNSPEC);
+            }
+        };
+        if !fixed {
+            // The renderer cannot map this resource directly at the reserved
+            // guest address. Fall back to an exported SHM or dma-buf FD.
+            memory.unmap(guest_addr).map_err(|_| RESP_ERR_UNSPEC)?;
+            let (fd_type, fd) = renderer.export_blob(id).map_err(|e| {
+                debug!("virtio-gpu: exporting blob {id}: {e}");
+                RESP_ERR_UNSPEC
+            })?;
+            if fd_type != 1 && fd_type != 3 {
+                return Err(RESP_ERR_UNSPEC);
+            }
+            memory.map_fd(guest_addr, fd.as_raw_fd(), len).map_err(|e| {
+                debug!("virtio-gpu: mapping exported blob {id}: {e}");
+                RESP_ERR_UNSPEC
+            })?;
+        }
+
+        let map_info = match renderer.blob_map_info(id) {
+            Ok(info) => info,
+            Err(e) => {
+                let _ = memory.unmap(guest_addr);
+                debug!("virtio-gpu: map info for blob {id}: {e}");
+                return Err(RESP_ERR_UNSPEC);
+            }
+        };
+        if let Some(Resource {
+            kind: Kind::Blob { mapped, .. },
+            ..
+        }) = self.resources.get_mut(&id) {
+            *mapped = Some(offset);
+        }
+        Ok(map_info)
+    }
+
+    fn unmap_blob(&mut self, id: u32) -> Result<(), u32> {
+        let offset = match self.resources.get(&id) {
+            Some(Resource {
+                kind: Kind::Blob { mapped: Some(offset), .. },
+                ..
+            }) => *offset,
+            Some(Resource { kind: Kind::Blob { .. }, .. }) => return Err(RESP_ERR_INVALID_PARAMETER),
+            Some(_) => return Err(RESP_ERR_INVALID_PARAMETER),
+            None => return Err(RESP_ERR_INVALID_RESOURCE_ID),
+        };
+        let memory = self.host_visible_memory.as_ref().ok_or(RESP_ERR_UNSPEC)?;
+        let guest_addr = memory
+            .guest_addr()
+            .checked_add(offset)
+            .ok_or(RESP_ERR_INVALID_PARAMETER)?;
+        memory.unmap(guest_addr).map_err(|e| {
+            debug!("virtio-gpu: unmapping blob {id}: {e}");
+            RESP_ERR_UNSPEC
+        })?;
+        if let Some(Resource {
+            kind: Kind::Blob { mapped, .. },
+            ..
+        }) = self.resources.get_mut(&id) {
+            *mapped = None;
+        }
+        Ok(())
     }
 
     fn create_2d(&mut self, r: &Request) -> Result<(), u32> {
@@ -972,6 +1213,18 @@ impl Worker {
         match resource.kind {
             Kind::Simple { pixels, .. } => self.bytes_2d -= pixels.len(),
             Kind::Renderer => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.destroy_resource(id);
+                }
+            }
+            Kind::Blob { mapped, .. } => {
+                if let (Some(offset), Some(memory)) = (mapped, &self.host_visible_memory) {
+                    if let Some(addr) = memory.guest_addr().checked_add(offset) {
+                        if let Err(e) = memory.unmap(addr) {
+                            warn!("virtio-gpu: unmapping blob {id} during release: {e}");
+                        }
+                    }
+                }
                 if let Some(renderer) = &mut self.renderer {
                     renderer.destroy_resource(id);
                 }
@@ -1115,6 +1368,11 @@ impl Worker {
                     warn!("virtio-gpu: reading resource {}: {e}", scanout.resource);
                 }
             }
+            Kind::Blob { .. } => {
+                // Blob scanout uses SET_SCANOUT_BLOB, which is not yet
+                // advertised; never reinterpret an opaque blob as a 2D texture.
+                return;
+            }
         }
     }
 
@@ -1178,6 +1436,9 @@ impl Worker {
             .resources
             .get_mut(&id)
             .ok_or(RESP_ERR_INVALID_RESOURCE_ID)?;
+        if matches!(&resource.kind, Kind::Blob { .. }) {
+            return Err(RESP_ERR_INVALID_PARAMETER);
+        }
         let Kind::Simple {
             pixels,
             backing,
@@ -1277,6 +1538,7 @@ impl Worker {
                 unsafe { renderer.attach_backing(id, slices) }
                     .map_err(|_| RESP_ERR_INVALID_PARAMETER)
             }
+            Kind::Blob { .. } => Err(RESP_ERR_INVALID_PARAMETER),
         }
     }
 
@@ -1299,6 +1561,7 @@ impl Worker {
                     renderer.detach_backing(id);
                 }
             }
+            Kind::Blob { .. } => return Err(RESP_ERR_INVALID_PARAMETER),
         }
         Ok(())
     }
@@ -1327,7 +1590,7 @@ impl Worker {
                 let id = r.u32(0);
                 // 2D resources are the device's own; the renderer never sees them.
                 if let Some(Resource {
-                    kind: Kind::Renderer,
+                    kind: Kind::Renderer | Kind::Blob { .. },
                     ..
                 }) = self.resources.get(&id)
                 {
