@@ -22,6 +22,7 @@ use crate::{Context, Status, fail, fail_with, guarded};
 
 pub(crate) const INPUT_KEYBOARD: u32 = 1 << 0;
 pub(crate) const INPUT_TABLET: u32 = 1 << 1;
+pub(crate) const INPUT_MOUSE: u32 = 1 << 2;
 
 /// `crate_frame`.
 #[repr(C)]
@@ -342,7 +343,7 @@ pub unsafe extern "C" fn crate_config_add_input(config: *mut Config, devices: u3
     // SAFETY: the caller's contract.
     unsafe {
         with(config, |c| {
-            if devices & !(INPUT_KEYBOARD | INPUT_TABLET) != 0 {
+            if devices & !(INPUT_KEYBOARD | INPUT_TABLET | INPUT_MOUSE) != 0 {
                 return fail(
                     Status::InvalidArgument,
                     format!("no input devices {devices:#x}"),
@@ -448,6 +449,22 @@ pub unsafe extern "C" fn crate_input_pointer(machine: *mut Machine, x: u32, y: u
     }
 }
 
+/// `crate_input_mouse`.
+///
+/// # Safety
+///
+/// `machine` is NULL or a live machine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn crate_input_mouse(machine: *mut Machine, dx: i32, dy: i32, buttons: u32) {
+    // SAFETY: the caller's contract.
+    if let Some(m) = unsafe { machine.as_ref() } {
+        guarded(|| {
+            m.virt.input().mouse(dx, dy, buttons);
+            Status::Ok
+        });
+    }
+}
+
 /// `crate_input_scroll`.
 ///
 /// # Safety
@@ -519,13 +536,13 @@ mod tests {
                 crate_config_add_vnc(c, 0, c"127.0.0.1:5905".as_ptr()),
                 Status::InvalidArgument
             );
-            assert_eq!(crate_config_add_input(c, 3), Status::Ok);
+            assert_eq!(crate_config_add_input(c, 7), Status::Ok);
             assert_eq!(crate_config_add_input(c, 8), Status::InvalidArgument);
             let config = &*c;
             assert_eq!(config.displays[0].gpu, Gpu::Virgl);
             assert_eq!(config.displays[0].modes[1], Mode::new(1280, 960));
             assert_eq!(config.displays[0].vnc.len(), 2);
-            assert_eq!(config.input, 3);
+            assert_eq!(config.input, 7);
             crate_config_free(c);
         }
     }

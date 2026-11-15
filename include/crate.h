@@ -299,6 +299,7 @@ crate_status crate_display_set_modes(crate_machine *machine, uint32_t display,
 
 #define CRATE_INPUT_KEYBOARD (1u << 0)
 #define CRATE_INPUT_TABLET (1u << 1) /* an absolute pointer: positions, not movements */
+#define CRATE_INPUT_MOUSE (1u << 2) /* a relative pointer: movements, not positions */
 
 /* virtio-input devices: a keyboard, absolute tablet and relative mouse,
    each its own device. The tablet and mouse each have three buttons and a
@@ -311,6 +312,8 @@ void crate_input_key(crate_machine *machine, uint16_t code, bool down);
 /* x and y from 0 to 32767 across the display; buttons: bit 0 left, bit 1
    right, bit 2 middle. */
 void crate_input_pointer(crate_machine *machine, uint32_t x, uint32_t y, uint32_t buttons);
+/* Relative mouse movement in guest pixels; buttons use the same bits as the tablet. */
+void crate_input_mouse(crate_machine *machine, int32_t dx, int32_t dy, uint32_t buttons);
 /* Wheel notches: positive dy scrolls down, positive dx right. */
 void crate_input_scroll(crate_machine *machine, int32_t dx, int32_t dy);
 

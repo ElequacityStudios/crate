@@ -125,6 +125,8 @@ pub trait InputSink: Send + Sync {
     /// An absolute position, 0 to `POINTER_MAX` across the screen in each
     /// direction, and the buttons held (`BUTTON_*`).
     fn pointer(&self, x: u32, y: u32, buttons: u32);
+    /// Relative mouse movement in guest pixels, and the buttons held (`BUTTON_*`).
+    fn mouse(&self, dx: i32, dy: i32, buttons: u32);
     /// Wheel notches: positive `dy` down, positive `dx` right.
     fn scroll(&self, dx: i32, dy: i32);
 }
