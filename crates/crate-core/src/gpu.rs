@@ -32,6 +32,17 @@ pub struct Capset {
 
 /// RESOURCE_CREATE_3D's arguments, as the guest gave them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// A virtio-gpu host3D blob passed to the renderer.
+#[derive(Clone, Copy, Debug)]
+pub struct BlobResource {
+    pub id: u32,
+    pub context: u32,
+    pub blob_id: u64,
+    pub memory: u32,
+    pub flags: u32,
+    pub size: u64,
+}
+
 pub struct Resource3d {
     pub id: u32,
     pub target: u32,
@@ -75,6 +86,35 @@ pub struct Transfer {
 pub type RendererResult<T> = std::result::Result<T, String>;
 
 pub trait Renderer {
+    /// Whether this renderer implements the virtio-gpu resource-blob protocol.
+    fn supports_blob(&self) -> bool {
+        false
+    }
+
+    /// Alignment required for guest mappings of host-visible blobs.
+    fn blob_alignment(&self) -> u32 {
+        0
+    }
+
+    /// Creates a host3D blob resource.
+    fn create_blob(&mut self, _blob: &BlobResource) -> RendererResult<()> {
+        Err("blob resources are unsupported".into())
+    }
+
+    /// Exports a blob's shared-memory file descriptor and its handle type.
+    fn export_blob(&mut self, _resource: u32) -> RendererResult<(u32, OwnedFd)> {
+        Err("blob export is unsupported".into())
+    }
+
+    /// Returns the guest mapping cache policy for a blob.
+    fn blob_map_info(&mut self, _resource: u32) -> RendererResult<u32> {
+        Err("blob mapping is unsupported".into())
+    }
+
+    /// Notifies the renderer that a guest blob mapping has been released.
+    fn unmap_blob(&mut self, _resource: u32) -> RendererResult<()> {
+        Err("blob unmapping is unsupported".into())
+    }
     /// For log messages: the renderer and what it runs on.
     fn description(&self) -> String;
 
