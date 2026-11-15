@@ -99,8 +99,14 @@ pub trait Renderer {
     }
 
     /// Creates a host3D blob resource.
-    fn create_blob(&mut self, _blob: &BlobResource) -> RendererResult<()> {
+    fn create_blob(&mut self, _blob: &BlobResource, _backing: &[HostSlice]) -> RendererResult<()> {
         Err("blob resources are unsupported".into())
+    }
+
+    /// Maps a blob into a host-visible guest RAM address when the renderer can
+    /// provide a fixed mapping. Returns false when the caller should try an FD.
+    fn map_blob_fixed(&mut self, _resource: u32, _host_addr: *mut u8) -> RendererResult<bool> {
+        Ok(false)
     }
 
     /// Exports a blob's shared-memory file descriptor and its handle type.

@@ -36,6 +36,10 @@ pub unsafe trait RamBlock: Send + Sync {
 /// A guest-physical shared-memory window backed by renderer-exported file descriptors.
 pub trait HostVisibleMemory: RamBlock {
     fn guest_addr(&self) -> u64;
+    fn alignment(&self) -> u32;
+    /// Reserves a non-overlapping range and returns its stable host address.
+    /// The caller must either populate it with a renderer mapping or call unmap.
+    fn reserve(&self, guest_addr: u64, len: usize) -> std::io::Result<*mut u8>;
     fn map_fd(&self, guest_addr: u64, fd: std::os::fd::RawFd, len: usize) -> std::io::Result<()>;
     fn unmap(&self, guest_addr: u64) -> std::io::Result<()>;
 }

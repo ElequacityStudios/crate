@@ -137,7 +137,11 @@ impl crate_core::memory::HostVisibleMemory for HostVisiblePool {
         self.guest_addr
     }
 
-    fn map_fd(&self, guest_addr: u64, fd: std::os::fd::RawFd, len: usize) -> std::io::Result<()> {
+    fn alignment(&self) -> u32 {
+        self.page_size as u32
+    }
+
+    fn reserve(&self, guest_addr: u64, len: usize) -> std::io::Result<*mut u8> {
         use std::ops::Bound::{Excluded, Unbounded};
 
         let (ptr, mapped_len) = self
@@ -161,6 +165,13 @@ impl crate_core::memory::HostVisibleMemory for HostVisiblePool {
                 "host-visible blob mapping overlaps an existing mapping",
             ));
         }
+        mappings.insert(guest_addr, mapped_len);
+        Ok(ptr.cast())
+    }
+
+    fn map_fd(&self, guest_addr: u64, fd: std::os::fd::RawFd, len: usize) -> std::io::Result<()> {
+        let ptr = self.reserve(guest_addr, len)?.cast::<libc::c_void>();
+        let mapped_len = self.mappings.lock().unwrap()[&guest_addr];
         let mapped = unsafe {
             libc::mmap(
                 ptr,
@@ -172,21 +183,21 @@ impl crate_core::memory::HostVisibleMemory for HostVisiblePool {
             )
         };
         if mapped == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
+            let error = std::io::Error::last_os_error();
+            let _ = self.unmap(guest_addr);
+            return Err(error);
         }
         if mapped != ptr {
+            let _ = self.unmap(guest_addr);
             return Err(std::io::Error::other("MAP_FIXED returned an unexpected address"));
         }
-        mappings.insert(guest_addr, mapped_len);
         Ok(())
     }
 
     fn unmap(&self, guest_addr: u64) -> std::io::Result<()> {
-        let mapped_len = self
-            .mappings
-            .lock()
-            .unwrap()
-            .remove(&guest_addr)
+        let mut mappings = self.mappings.lock().unwrap();
+        let mapped_len = *mappings
+            .get(&guest_addr)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "blob mapping not found"))?;
         let offset = usize::try_from(guest_addr - self.guest_addr)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid blob address"))?;
@@ -204,6 +215,7 @@ impl crate_core::memory::HostVisibleMemory for HostVisiblePool {
         if mapped == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
+        mappings.remove(&guest_addr);
         Ok(())
     }
 }

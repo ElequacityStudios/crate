@@ -23,10 +23,12 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
+use std::os::fd::{FromRawFd, OwnedFd};
 
 use crate_core::display::Rect;
 use crate_core::gpu::{
-    Box3d, Capset, HostSlice, Renderer, RendererFactory, RendererResult, Resource3d, Transfer,
+    BlobResource, Box3d, Capset, HostSlice, Renderer, RendererFactory, RendererResult,
+    Resource3d, Transfer,
 };
 use crate_core::{Error, Result, debug, info, warn};
 
@@ -137,6 +139,43 @@ struct VirglResourceArgs {
     last_level: u32,
     nr_samples: u32,
     flags: u32,
+}
+
+#[repr(C)]
+struct VirglBlobArgs {
+    res_handle: u32,
+    ctx_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    iovecs: *const libc::iovec,
+    num_iovs: u32,
+}
+
+/// Optional entry points provided by the Venus-enabled virglrenderer build.
+struct BlobFunctions {
+    create: unsafe extern "C" fn(*const VirglBlobArgs) -> c_int,
+    export: unsafe extern "C" fn(u32, *mut u32, *mut c_int) -> c_int,
+    get_map_info: unsafe extern "C" fn(u32, *mut u32) -> c_int,
+    map_fixed: Option<unsafe extern "C" fn(u32, *mut c_void) -> c_int>,
+}
+
+impl BlobFunctions {
+    fn load(library: &Library) -> Option<Self> {
+        let create = library.symbol("virgl_renderer_resource_create_blob").ok()?;
+        let export = library.symbol("virgl_renderer_resource_export_blob").ok()?;
+        let get_map_info = library.symbol("virgl_renderer_resource_get_map_info").ok()?;
+        let map_fixed = library.symbol("virgl_renderer_resource_map_fixed").ok().map(|p| unsafe {
+            std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut c_void) -> c_int>(p)
+        });
+        Some(Self {
+            create: unsafe { std::mem::transmute(create) },
+            export: unsafe { std::mem::transmute(export) },
+            get_map_info: unsafe { std::mem::transmute(get_map_info) },
+            map_fixed,
+        })
+    }
 }
 
 /// A library opened with dlopen, closed never: its functions may still be
@@ -472,7 +511,10 @@ fn library_names(variable: &str, defaults: &[&str]) -> Vec<String> {
 }
 
 #[cfg(target_os = "ios")]
-const VIRGL_NAMES: &[&str] = &["@rpath/virglrenderer.1.framework/virglrenderer.1"];
+const VIRGL_NAMES: &[&str] = &[
+    "@rpath/virglrenderer.venus.framework/virglrenderer.venus",
+    "@rpath/virglrenderer.1.framework/virglrenderer.1",
+];
 #[cfg(target_os = "ios")]
 const EGL_NAMES: &[&str] = &["@rpath/EGL.framework/EGL"];
 #[cfg(target_os = "macos")]
@@ -496,6 +538,8 @@ struct Inner {
     description: String,
     /// The backing handed to each resource, which is ours to free.
     backings: HashMap<u32, Box<[libc::iovec]>>,
+    blob_backings: HashMap<u32, Box<[libc::iovec]>>,
+    blobs: Option<BlobFunctions>,
     /// Fences made and not yet retired, oldest first.
     fences: VecDeque<u64>,
     _libraries: [Library; 2],
@@ -508,6 +552,7 @@ impl Inner {
         let virgl_library = Library::open(&library_names("CRATE_VIRGLRENDERER", VIRGL_NAMES))?;
         let egl = EglFunctions::load(|name| egl_library.symbol(name))?;
         let virgl = VirglFunctions::load(|name| virgl_library.symbol(name))?;
+        let blobs = BlobFunctions::load(&virgl_library);
         if let Ok(set_log) = virgl_library.symbol("virgl_set_log_callback") {
             // SAFETY: virglrenderer's function of that name.
             let set_log = unsafe { std::mem::transmute::<*mut c_void, SetLogCallback>(set_log) };
@@ -637,6 +682,8 @@ impl Inner {
             _callbacks: callbacks,
             description: format!("virglrenderer, ANGLE {platform}: {renderer}, {version}"),
             backings: HashMap::new(),
+            blob_backings: HashMap::new(),
+            blobs,
             fences: VecDeque::new(),
             _libraries: [egl_library, virgl_library],
         })
@@ -798,6 +845,84 @@ fn status(what: &str, code: c_int) -> RendererResult<()> {
 }
 
 impl Renderer for Virgl {
+    fn supports_blob(&self) -> bool {
+        self.inner.as_ref().is_some_and(|inner| inner.blobs.is_some())
+    }
+
+    fn blob_alignment(&self) -> u32 {
+        if self.supports_blob() { 16384 } else { 0 }
+    }
+
+    fn create_blob(&mut self, blob: &BlobResource, backing: &[HostSlice]) -> RendererResult<()> {
+        let inner = self.inner();
+        let functions = inner.blobs.as_ref().ok_or_else(|| "Venus blob API is unavailable".to_string())?;
+        let iovecs: Box<[libc::iovec]> = backing
+            .iter()
+            .map(|slice| libc::iovec {
+                iov_base: slice.ptr.cast(),
+                iov_len: slice.len,
+            })
+            .collect();
+        let args = VirglBlobArgs {
+            res_handle: blob.id,
+            ctx_id: blob.context,
+            blob_mem: blob.memory,
+            blob_flags: blob.flags,
+            blob_id: blob.blob_id,
+            size: blob.size,
+            iovecs: if iovecs.is_empty() { ptr::null() } else { iovecs.as_ptr() },
+            num_iovs: iovecs.len() as u32,
+        };
+        // SAFETY: args and iovec array remain valid for the call; guest backing
+        // remains valid until this resource is destroyed.
+        let code = unsafe { (functions.create)(&args) };
+        status("resource_create_blob", code)?;
+        if !iovecs.is_empty() {
+            inner.blob_backings.insert(blob.id, iovecs);
+        }
+        Ok(())
+    }
+
+    fn map_blob_fixed(&mut self, resource: u32, host_addr: *mut u8) -> RendererResult<bool> {
+        let inner = self.inner();
+        let Some(functions) = &inner.blobs else { return Ok(false) };
+        let Some(map_fixed) = functions.map_fixed else { return Ok(false) };
+        // SAFETY: host_addr is a reserved, page-aligned range in the guest's
+        // host-visible RAM window, held for the lifetime of the mapping.
+        let code = unsafe { map_fixed(resource, host_addr.cast()) };
+        if code == 0 {
+            Ok(true)
+        } else if code == -libc::EOPNOTSUPP || code == -libc::ENOTSUP {
+            Ok(false)
+        } else {
+            Err(format!("resource_map_fixed: {code}"))
+        }
+    }
+
+    fn export_blob(&mut self, resource: u32) -> RendererResult<(u32, OwnedFd)> {
+        let inner = self.inner();
+        let functions = inner.blobs.as_ref().ok_or_else(|| "Venus blob API is unavailable".to_string())?;
+        let (mut fd_type, mut fd) = (0, -1);
+        // SAFETY: fd_type and fd are valid output parameters.
+        let code = unsafe { (functions.export)(resource, &mut fd_type, &mut fd) };
+        status("resource_export_blob", code)?;
+        if fd < 0 {
+            return Err("resource_export_blob returned an invalid FD".into());
+        }
+        // SAFETY: successful export transfers ownership of this new FD.
+        Ok((fd_type, unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn blob_map_info(&mut self, resource: u32) -> RendererResult<u32> {
+        let inner = self.inner();
+        let functions = inner.blobs.as_ref().ok_or_else(|| "Venus blob API is unavailable".to_string())?;
+        let mut info = 0;
+        // SAFETY: info is the API's output parameter.
+        let code = unsafe { (functions.get_map_info)(resource, &mut info) };
+        status("resource_get_map_info", code)?;
+        Ok(info)
+    }
+
     fn description(&self) -> String {
         self.inner
             .as_ref()
@@ -980,6 +1105,7 @@ impl Inner {
 
     fn destroy_resource(&mut self, resource: u32) {
         self.detach(resource);
+        self.blob_backings.remove(&resource);
         // SAFETY: virglrenderer checks the id.
         unsafe { (self.virgl.virgl_renderer_resource_unref)(resource) };
     }
