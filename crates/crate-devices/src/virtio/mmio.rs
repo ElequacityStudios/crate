@@ -15,7 +15,8 @@ use crate_core::warn;
 
 use super::queue::QueueConfig;
 use super::{
-    Activation, F_VERSION_1, Interrupt, Queue, STATUS_DRIVER_OK, STATUS_FEATURES_OK, VirtioDevice,
+    Activation, F_VERSION_1, Interrupt, Queue, SharedMemoryRegion, STATUS_DRIVER_OK,
+    STATUS_FEATURES_OK, VirtioDevice,
 };
 
 pub const SIZE: u64 = 0x200;
@@ -48,6 +49,8 @@ const REG_QUEUE_DEVICE_LOW: u64 = 0x0a0;
 const REG_QUEUE_DEVICE_HIGH: u64 = 0x0a4;
 const REG_SHM_SEL: u64 = 0x0ac;
 const REG_SHM_LEN_LOW: u64 = 0x0b0;
+const REG_SHM_LEN_HIGH: u64 = 0x0b4;
+const REG_SHM_BASE_LOW: u64 = 0x0b8;
 const REG_SHM_BASE_HIGH: u64 = 0x0bc;
 const REG_CONFIG_GENERATION: u64 = 0x0fc;
 const REG_CONFIG: u64 = 0x100;
@@ -58,6 +61,7 @@ struct Inner {
     driver_features_sel: u32,
     driver_features: u64,
     queue_sel: u32,
+    shm_sel: u32,
     queues: Vec<QueueConfig>,
     status: u32,
     active: bool,
@@ -74,6 +78,7 @@ impl Inner {
         self.driver_features_sel = 0;
         self.driver_features = 0;
         self.queue_sel = 0;
+        self.shm_sel = 0;
         for q in &mut self.queues {
             *q = QueueConfig::default();
         }
@@ -98,6 +103,7 @@ impl VirtioMmio {
                 driver_features_sel: 0,
                 driver_features: 0,
                 queue_sel: 0,
+                shm_sel: 0,
                 queues,
                 status: 0,
                 active: false,
@@ -181,8 +187,23 @@ impl MmioDevice for VirtioMmio {
                 .is_some_and(|q| q.ready) as u32,
             REG_INTERRUPT_STATUS => self.interrupt.status(),
             REG_STATUS => inner.status,
-            // No shared memory regions: a length of all ones says so.
-            REG_SHM_LEN_LOW..=REG_SHM_BASE_HIGH => u32::MAX,
+            REG_SHM_SEL => inner.shm_sel,
+            REG_SHM_LEN_LOW => inner
+                .device
+                .shared_memory_region(inner.shm_sel)
+                .map_or(u32::MAX, |region| region.len as u32),
+            REG_SHM_LEN_HIGH => inner
+                .device
+                .shared_memory_region(inner.shm_sel)
+                .map_or(u32::MAX, |region| (region.len >> 32) as u32),
+            REG_SHM_BASE_LOW => inner
+                .device
+                .shared_memory_region(inner.shm_sel)
+                .map_or(0, |region| region.addr as u32),
+            REG_SHM_BASE_HIGH => inner
+                .device
+                .shared_memory_region(inner.shm_sel)
+                .map_or(0, |region| (region.addr >> 32) as u32),
             REG_CONFIG_GENERATION => 0,
             _ => 0,
         };
@@ -259,7 +280,7 @@ impl MmioDevice for VirtioMmio {
             }
             REG_INTERRUPT_ACK => self.interrupt.acknowledge(v as u32),
             REG_STATUS => self.set_status(&mut inner, v as u32),
-            REG_SHM_SEL => {}
+            REG_SHM_SEL => inner.shm_sel = v as u32,
             _ => {}
         }
     }
@@ -276,6 +297,7 @@ mod tests {
     struct Echo {
         active: Option<Activation>,
         resets: usize,
+        shm_region: Option<SharedMemoryRegion>,
     }
 
     impl VirtioDevice for Echo {
@@ -290,6 +312,9 @@ mod tests {
         }
         fn read_config(&self, offset: u64, data: &mut [u8]) {
             super::super::read_config_bytes(&[1, 2, 3, 4, 5, 6, 7, 8], offset, data);
+        }
+        fn shared_memory_region(&self, id: u32) -> Option<SharedMemoryRegion> {
+            (id == 1).then_some(self.shm_region).flatten()
         }
         fn activate(&mut self, activation: Activation) {
             self.active = Some(activation);
@@ -317,6 +342,7 @@ mod tests {
             Box::new(Echo {
                 active: None,
                 resets: 0,
+                shm_region: None,
             }),
             memory.clone(),
             IrqLine::new(chip.clone(), 16),
@@ -363,6 +389,33 @@ mod tests {
         assert_eq!(dev.read(REG_CONFIG + 2, 2), 0x0403);
         assert_eq!(dev.read(REG_CONFIG + 4, 4), 0x0807_0605);
         assert_eq!(dev.read(REG_SHM_LEN_LOW, 4), 0xffff_ffff);
+    }
+
+    #[test]
+    fn exposes_selected_shared_memory_region() {
+        let memory = memory();
+        let chip = Arc::new(LevelRecorder::default());
+        let dev = VirtioMmio::new(
+            Box::new(Echo {
+                active: None,
+                resets: 0,
+                shm_region: Some(SharedMemoryRegion {
+                    addr: 0x1234_5678_9abc_0000,
+                    len: 0x0000_0001_2345_0000,
+                }),
+            }),
+            memory,
+            IrqLine::new(chip, 16),
+        );
+        dev.write(REG_SHM_SEL, 4, 1);
+        assert_eq!(dev.read(REG_SHM_SEL, 4), 1);
+        assert_eq!(dev.read(REG_SHM_LEN_LOW, 4), 0x2345_0000);
+        assert_eq!(dev.read(REG_SHM_LEN_HIGH, 4), 1);
+        assert_eq!(dev.read(REG_SHM_BASE_LOW, 4), 0x9abc_0000);
+        assert_eq!(dev.read(REG_SHM_BASE_HIGH, 4), 0x1234_5678);
+        dev.write(REG_SHM_SEL, 4, 2);
+        assert_eq!(dev.read(REG_SHM_LEN_LOW, 4), u32::MAX as u64);
+        assert_eq!(dev.read(REG_SHM_LEN_HIGH, 4), u32::MAX as u64);
     }
 
     #[test]

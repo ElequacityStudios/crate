@@ -33,6 +33,13 @@ pub const ID_NET: u32 = 1;
 pub const ID_BLOCK: u32 = 2;
 pub const ID_CONSOLE: u32 = 3;
 
+/// A transport-visible shared-memory window advertised through virtio-mmio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedMemoryRegion {
+    pub addr: u64,
+    pub len: u64,
+}
+
 pub const F_INDIRECT_DESC: u64 = 1 << 28;
 pub const F_VERSION_1: u64 = 1 << 32;
 
@@ -107,6 +114,10 @@ pub trait VirtioDevice: Send {
     fn queue_max_sizes(&self) -> &[u16];
     /// Reads the device-specific configuration space.
     fn read_config(&self, offset: u64, data: &mut [u8]);
+    /// Returns a transport-visible shared-memory region by its device-defined ID.
+    fn shared_memory_region(&self, _id: u32) -> Option<SharedMemoryRegion> {
+        None
+    }
     fn write_config(&mut self, _offset: u64, _data: &[u8]) {}
     /// The driver set DRIVER_OK. `activation.queues` has one queue per entry
     /// of `queue_max_sizes`; one the driver did not enable is not ready and
