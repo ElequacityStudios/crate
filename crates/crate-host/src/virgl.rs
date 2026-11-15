@@ -22,6 +22,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
+use std::sync::Mutex;
 use std::os::fd::{FromRawFd, OwnedFd};
 
 use crate_core::display::Rect;
