@@ -84,6 +84,7 @@ const GL_UNSIGNED_BYTE: u32 = 0x1401;
 
 // virglrenderer.h
 const VIRGL_RENDERER_USE_GLES: c_int = 1 << 4;
+const VIRGL_RENDERER_VENUS: c_int = 1 << 6;
 const VIRGL_RENDERER_CALLBACKS_VERSION: c_int = 4;
 const CAPSET_VIRGL: u32 = 1;
 const CAPSET_VIRGL2: u32 = 2;
@@ -684,7 +685,7 @@ impl Inner {
         // SAFETY: the cookie and callbacks are boxed and live as long as the
         // renderer, which cleans up before dropping them.
         let status = unsafe {
-            (virgl.virgl_renderer_init)(cookie, VIRGL_RENDERER_USE_GLES, &mut *callbacks)
+            (virgl.virgl_renderer_init)(cookie, VIRGL_RENDERER_USE_GLES | VIRGL_RENDERER_VENUS, &mut *callbacks)
         };
         if status != 0 {
             gl.make_current(ptr::null_mut());
