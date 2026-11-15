@@ -55,6 +55,7 @@ const F_RESOURCE_BLOB: u64 = 1 << 3;
 const F_CONTEXT_INIT: u64 = 1 << 4;
 const F_BLOB_ALIGNMENT: u64 = 1 << 5;
 const CAPSET_VENUS: u32 = 4;
+const VIRGL_RENDERER_FENCE_FLAG_MERGEABLE: u32 = 1 << 0;
 
 const EVENT_DISPLAY: u32 = 1 << 0;
 
@@ -328,6 +329,7 @@ impl Gpu {
                     bytes_2d: 0,
                     scanouts: vec![Scanout::default(); SCANOUTS as usize],
                     fenced: VecDeque::new(),
+                    context_fenced: VecDeque::new(),
                     trace: std::env::var_os("CRATE_GPU_TRACE").is_some(),
                 };
                 worker.run();
@@ -590,6 +592,15 @@ struct Fenced {
     answer: Vec<u8>,
 }
 
+/// An answer held back until a fence on one context timeline retires.
+struct FencedContext {
+    context: u32,
+    ring_idx: u32,
+    fence: u64,
+    chain: Chain,
+    answer: Vec<u8>,
+}
+
 struct Worker {
     shared: Arc<Shared>,
     sink: Arc<dyn DisplaySink>,
@@ -605,6 +616,7 @@ struct Worker {
     bytes_2d: usize,
     scanouts: Vec<Scanout>,
     fenced: VecDeque<Fenced>,
+    context_fenced: VecDeque<FencedContext>,
     /// CRATE_GPU_TRACE: log every control command.
     trace: bool,
 }
@@ -692,6 +704,7 @@ impl Worker {
         self.cursor = None;
         self.interrupt = None;
         self.fenced.clear();
+        self.context_fenced.clear();
         if let Some(memory) = &self.host_visible_memory {
             for resource in self.resources.values() {
                 if let Kind::Blob { mapped: Some(offset), .. } = &resource.kind {
@@ -750,24 +763,48 @@ impl Worker {
                 used |= self.complete(&chain, &answer);
                 continue;
             };
-            let answer = self.command(&request);
+            let mut answer = self.command(&request);
             if request.fenced() {
-                let fenced = match &mut self.renderer {
-                    Some(renderer) => renderer
-                        .create_fence(request.fence, request.context)
-                        .map_err(|e| warn!("virtio-gpu: fence {}: {e}", request.fence))
-                        .is_ok(),
-                    None => false,
-                };
-                // With a renderer every fence goes through it, so they answer
-                // in the order they were made.
-                if fenced {
-                    self.fenced.push_back(Fenced {
-                        fence: request.fence,
-                        chain,
-                        answer,
+                if request.flags & FLAG_INFO_RING_IDX != 0 {
+                    let result = self.renderer.as_mut().map(|renderer| {
+                        renderer.create_context_fence(
+                            request.context,
+                            VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
+                            request.ring as u32,
+                            request.fence,
+                        )
                     });
-                    continue;
+                    if matches!(result, Some(Ok(()))) {
+                        self.context_fenced.push_back(FencedContext {
+                            context: request.context,
+                            ring_idx: request.ring as u32,
+                            fence: request.fence,
+                            chain,
+                            answer,
+                        });
+                        continue;
+                    }
+                    if let Some(Err(e)) = result {
+                        warn!("virtio-gpu: context fence {}:{}:{}: {e}", request.context, request.ring, request.fence);
+                    }
+                    answer = request.answer(RESP_ERR_UNSPEC, &[]);
+                } else {
+                    let fenced = match &mut self.renderer {
+                        Some(renderer) => renderer
+                            .create_fence(request.fence, request.context)
+                            .map_err(|e| warn!("virtio-gpu: fence {}: {e}", request.fence))
+                            .is_ok(),
+                        None => false,
+                    };
+                    // Global virgl fences retire in submission order.
+                    if fenced {
+                        self.fenced.push_back(Fenced {
+                            fence: request.fence,
+                            chain,
+                            answer,
+                        });
+                        continue;
+                    }
                 }
             }
             used |= self.complete(&chain, &answer);
@@ -793,25 +830,44 @@ impl Worker {
     }
 
     fn retire_fences(&mut self) {
-        if self.fenced.is_empty() {
+        if self.fenced.is_empty() && self.context_fenced.is_empty() {
             return;
         }
         let Some(renderer) = &mut self.renderer else {
             return;
         };
         let retired = renderer.poll();
-        let Some(&last) = retired.last() else {
-            return;
-        };
-        if !self.fenced.iter().any(|f| f.fence == last) {
-            return;
-        }
+        let context_retired = renderer.poll_context_fences();
         let mut used = false;
-        // Retiring a fence retires every one made before it.
-        while let Some(f) = self.fenced.pop_front() {
-            used |= self.complete(&f.chain, &f.answer);
-            if f.fence == last {
-                break;
+
+        if let Some(&last) = retired.last() {
+            if self.fenced.iter().any(|f| f.fence == last) {
+                // Global virgl fences retire every earlier global fence.
+                while let Some(f) = self.fenced.pop_front() {
+                    used |= self.complete(&f.chain, &f.answer);
+                    if f.fence == last {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Venus timelines are independent: retire only the matching context
+        // and ring, through the last fence reported on that timeline.
+        for done in context_retired {
+            let mut index = 0;
+            while index < self.context_fenced.len() {
+                let matches = self.context_fenced.get(index).is_some_and(|f| {
+                    f.context == done.context
+                        && f.ring_idx == done.ring_idx
+                        && f.fence <= done.fence
+                });
+                if matches {
+                    let f = self.context_fenced.remove(index).unwrap();
+                    used |= self.complete(&f.chain, &f.answer);
+                } else {
+                    index += 1;
+                }
             }
         }
         if used {
