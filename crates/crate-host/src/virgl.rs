@@ -319,6 +319,7 @@ impl EglFunctions {
 type LogCallback = extern "C" fn(c_int, *const c_char, *mut c_void);
 type SetLogCallback =
     unsafe extern "C" fn(Option<LogCallback>, *mut c_void, Option<extern "C" fn(*mut c_void)>);
+type ContextCreateWithFlags = unsafe extern "C" fn(u32, u32, u32, *const c_char) -> c_int;
 
 /// What virglrenderer's callbacks reach: the EGL display and contexts.
 struct Gl {
@@ -541,6 +542,7 @@ struct Inner {
     backings: HashMap<u32, Box<[libc::iovec]>>,
     blob_backings: HashMap<u32, Box<[libc::iovec]>>,
     blobs: Option<BlobFunctions>,
+    context_create_with_flags: Option<ContextCreateWithFlags>,
     /// Fences made and not yet retired, oldest first.
     fences: VecDeque<u64>,
     _libraries: [Library; 2],
@@ -554,6 +556,9 @@ impl Inner {
         let egl = EglFunctions::load(|name| egl_library.symbol(name))?;
         let virgl = VirglFunctions::load(|name| virgl_library.symbol(name))?;
         let blobs = BlobFunctions::load(&virgl_library);
+        let context_create_with_flags = virgl_library.symbol("virgl_renderer_context_create_with_flags").ok().map(|symbol| unsafe {
+            std::mem::transmute::<*mut c_void, ContextCreateWithFlags>(symbol)
+        });
         if let Ok(set_log) = virgl_library.symbol("virgl_set_log_callback") {
             // SAFETY: virglrenderer's function of that name.
             let set_log = unsafe { std::mem::transmute::<*mut c_void, SetLogCallback>(set_log) };
@@ -685,6 +690,7 @@ impl Inner {
             backings: HashMap::new(),
             blob_backings: HashMap::new(),
             blobs,
+            context_create_with_flags,
             fences: VecDeque::new(),
             _libraries: [egl_library, virgl_library],
         })
@@ -939,8 +945,8 @@ impl Renderer for Virgl {
         self.inner().fill_capset(id, version, out)
     }
 
-    fn create_context(&mut self, context: u32, name: &[u8]) -> RendererResult<()> {
-        self.inner().create_context(context, name)
+    fn create_context(&mut self, context: u32, context_init: u32, name: &[u8]) -> RendererResult<()> {
+        self.inner().create_context(context, context_init, name)
     }
 
     fn destroy_context(&mut self, context: u32) {
@@ -1046,20 +1052,29 @@ impl Inner {
         unsafe { (self.virgl.virgl_renderer_fill_caps)(id, version, out.as_mut_ptr().cast()) };
     }
 
-    fn create_context(&mut self, context: u32, name: &[u8]) -> RendererResult<()> {
+    fn create_context(&mut self, context: u32, context_init: u32, name: &[u8]) -> RendererResult<()> {
         // virglrenderer makes the new context's GL context current to set it
         // up, yet goes on believing the one before is current: the next
         // command for the earlier context would then run in the new GL
         // context, which has none of its vertex arrays and framebuffers. So
         // whatever was current goes back.
         let previous = self.gl.current();
-        // SAFETY: a name of that many bytes.
-        let code = unsafe {
-            (self.virgl.virgl_renderer_context_create)(
-                context,
-                name.len() as u32,
-                name.as_ptr().cast(),
-            )
+        let code = if context_init == 0 {
+            // Preserve the legacy virgl2 default for guests that don't use
+            // VIRTIO_GPU_F_CONTEXT_INIT.
+            unsafe {
+                (self.virgl.virgl_renderer_context_create)(
+                    context,
+                    name.len() as u32,
+                    name.as_ptr().cast(),
+                )
+            }
+        } else if let Some(create) = self.context_create_with_flags {
+            // SAFETY: UTM's virglrenderer exports this API for capset-selected
+            // contexts, including Venus (capset 4).
+            unsafe { create(context, context_init, name.len() as u32, name.as_ptr().cast()) }
+        } else {
+            return Err("virglrenderer does not support context_init".into());
         };
         self.gl.restore(previous);
         status("context_create", code)
