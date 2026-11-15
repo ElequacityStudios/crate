@@ -34,11 +34,14 @@ use std::time::{Duration, Instant};
 
 use crate_core::display::{DisplayControl, DisplaySink, Frame, Mode, Rect};
 use crate_core::gpu::{Box3d, Capset, HostSlice, Renderer, RendererFactory, Resource3d, Transfer};
-use crate_core::memory::GuestMemory;
+use crate_core::memory::{GuestMemory, HostVisibleMemory};
 use crate_core::{debug, info, warn};
 
 use super::queue::Chain;
-use super::{Activation, F_VERSION_1, Interrupt, Queue, VirtioDevice, read_config_bytes};
+use super::{
+    Activation, F_VERSION_1, Interrupt, Queue, SharedMemoryRegion, VirtioDevice,
+    read_config_bytes,
+};
 
 pub mod edid;
 pub mod format;
@@ -113,6 +116,8 @@ pub struct GpuConfig {
     /// The 3D renderer, made on the GPU thread. Without one, or when it fails,
     /// the device is 2D only.
     pub renderer: Option<RendererFactory>,
+    /// Host-visible memory shared with a Venus renderer, if 3D is enabled.
+    pub host_visible_memory: Option<Arc<dyn HostVisibleMemory>>,
 }
 
 /// What the device and its thread share.
@@ -233,6 +238,8 @@ pub struct Gpu {
     features: u64,
     capsets: u32,
     shared: Arc<Shared>,
+    host_visible_region: Option<SharedMemoryRegion>,
+    _host_visible_memory: Option<Arc<dyn HostVisibleMemory>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -264,6 +271,13 @@ impl Gpu {
         let (ready, started) = mpsc::channel();
         let sink = config.sink;
         let factory = config.renderer;
+        let host_visible_region = config.host_visible_memory.as_ref().map(|memory| {
+            SharedMemoryRegion {
+                addr: memory.guest_addr(),
+                len: memory.len() as u64,
+            }
+        });
+        let host_visible_memory = config.host_visible_memory;
         let thread_shared = shared.clone();
         let thread = std::thread::Builder::new()
             .name("crate-gpu".into())
@@ -310,6 +324,8 @@ impl Gpu {
             features,
             capsets,
             shared,
+            host_visible_region,
+            _host_visible_memory: host_visible_memory,
             thread: Some(thread),
         })
     }
@@ -340,6 +356,10 @@ impl VirtioDevice for Gpu {
 
     fn features(&self) -> u64 {
         self.features
+    }
+
+    fn shared_memory_region(&self, id: u32) -> Option<SharedMemoryRegion> {
+        (id == 1).then_some(self.host_visible_region).flatten()
     }
 
     fn queue_max_sizes(&self) -> &[u16] {

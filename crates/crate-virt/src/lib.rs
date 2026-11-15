@@ -21,7 +21,7 @@ use crate_core::bus::MmioBus;
 use crate_core::display::{DisplaySink, InputSink, Mode};
 use crate_core::gpu::RendererFactory;
 use crate_core::irq::{InterruptController, IrqLine};
-use crate_core::memory::{GuestMemory, RamBlock};
+use crate_core::memory::{GuestMemory, HostVisibleMemory, RamBlock};
 use crate_core::net::NetBackend;
 use crate_core::psci::Psci;
 use crate_core::run::{RunControl, StopReason};
@@ -33,7 +33,7 @@ use crate_devices::virtio::input::{Input, InputKind, Inputs};
 use crate_devices::virtio::mmio::VirtioMmio;
 use crate_devices::virtio::{VirtioDevice, block::Block, net::Net};
 use crate_devices::{pl011, pl011::Pl011, pl031, pl031::Pl031};
-use crate_host::ram::AnonymousRam;
+use crate_host::ram::{AnonymousRam, HostVisiblePool};
 
 pub mod boot;
 pub mod fdt;
@@ -65,6 +65,8 @@ pub struct NetworkConfig {
     /// Without one, network n gets 02:63:72:61:74:65+n, the same every run.
     pub mac: Option<[u8; 6]>,
 }
+
+const GPU_BLOB_SIZE: u64 = 1 << 30;
 
 pub struct DisplayConfig {
     /// Offered to the guest in this order; the first is the preferred size.
@@ -199,7 +201,22 @@ impl VirtMachine {
         )?;
 
         let ram: Arc<dyn RamBlock> = Arc::new(AnonymousRam::new(config.memory as usize)?);
-        let memory = Arc::new(GuestMemory::new(vec![(RAM_BASE, ram.clone())])?);
+        let mut memory_regions: Vec<(u64, Arc<dyn RamBlock>)> = vec![(RAM_BASE, ram.clone())];
+        let mut gpu_pools = Vec::with_capacity(config.displays.len());
+        let mut reserved_memory = Vec::new();
+        let mut gpu_base = RAM_BASE + ram.len() as u64;
+        for display in &config.displays {
+            if display.renderer.is_some() {
+                let pool = Arc::new(HostVisiblePool::new(gpu_base, GPU_BLOB_SIZE as usize)?);
+                memory_regions.push((gpu_base, pool.clone()));
+                reserved_memory.push((gpu_base, GPU_BLOB_SIZE));
+                gpu_pools.push(Some(pool));
+                gpu_base += GPU_BLOB_SIZE;
+            } else {
+                gpu_pools.push(None);
+            }
+        }
+        let memory = Arc::new(GuestMemory::new(memory_regions)?);
         let load = |addr: u64, data: &[u8]| {
             memory
                 .write(addr, data)
@@ -273,11 +290,16 @@ impl VirtMachine {
             }
         }
         let mut displays = Vec::new();
-        for display in config.displays.drain(..) {
+        for (display, pool) in config.displays.drain(..).zip(gpu_pools.into_iter()) {
+            let host_visible_memory: Option<Arc<dyn HostVisibleMemory>> = pool.map(|pool| {
+                let memory: Arc<dyn HostVisibleMemory> = pool;
+                memory
+            });
             let gpu = Gpu::new(GpuConfig {
                 modes: display.modes,
                 sink: display.sink,
                 renderer: display.renderer,
+                host_visible_memory,
             })?;
             displays.push(gpu.control());
             devices.push(Box::new(gpu));
@@ -317,6 +339,7 @@ impl VirtMachine {
             cmdline: &config.cmdline,
             initrd: placement.initrd,
             virtio_slots: virtio_count,
+            reserved_memory: &reserved_memory,
         });
         if dtb.len() as u64 > boot::DTB_MAX {
             return Err(Error::InvalidArgument(
@@ -403,6 +426,7 @@ struct DeviceTree<'a> {
     cmdline: &'a str,
     initrd: Option<(u64, u64)>,
     virtio_slots: usize,
+    reserved_memory: &'a [(u64, u64)],
 }
 
 const PHANDLE_GIC: u32 = 1;
@@ -442,6 +466,20 @@ fn device_tree(t: &DeviceTree) -> Vec<u8> {
     w.property_string("device_type", "memory");
     w.property_reg(&[(RAM_BASE, t.memory)]);
     w.end_node();
+
+    if !t.reserved_memory.is_empty() {
+        w.begin_node("reserved-memory");
+        w.property_u32("#address-cells", 2);
+        w.property_u32("#size-cells", 2);
+        w.property_empty("ranges");
+        for (base, size) in t.reserved_memory {
+            w.begin_node(&format!("gpu-blob@{base:x}"));
+            w.property_reg(&[(*base, *size)]);
+            w.property_empty("no-map");
+            w.end_node();
+        }
+        w.end_node();
+    }
 
     w.begin_node("cpus");
     w.property_u32("#address-cells", 1);
@@ -546,6 +584,7 @@ mod tests {
             cmdline: "console=ttyAMA0 root=/dev/vda",
             initrd: Some((0x8000_0000, 0x8100_0000)),
             virtio_slots,
+            reserved_memory: &[],
         });
         fdt::parse(&blob).unwrap()
     }
