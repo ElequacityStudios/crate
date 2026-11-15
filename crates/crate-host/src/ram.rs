@@ -211,6 +211,7 @@ impl crate_core::memory::HostVisibleMemory for HostVisiblePool {
 #[cfg(test)]
 mod host_visible_pool_tests {
     use super::*;
+    use crate_core::memory::HostVisibleMemory;
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
 
