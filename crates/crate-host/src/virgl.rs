@@ -27,7 +27,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 
 use crate_core::display::Rect;
 use crate_core::gpu::{
-    BlobResource, Box3d, Capset, HostSlice, Renderer, RendererFactory, RendererResult,
+    BlobResource, Box3d, Capset, ContextFence, HostSlice, Renderer, RendererFactory, RendererResult,
     Resource3d, Transfer,
 };
 use crate_core::{Error, Result, debug, info, warn};
@@ -320,6 +320,7 @@ type LogCallback = extern "C" fn(c_int, *const c_char, *mut c_void);
 type SetLogCallback =
     unsafe extern "C" fn(Option<LogCallback>, *mut c_void, Option<extern "C" fn(*mut c_void)>);
 type ContextCreateWithFlags = unsafe extern "C" fn(u32, u32, u32, *const c_char) -> c_int;
+type ContextCreateFence = unsafe extern "C" fn(u32, u32, u32, u64) -> c_int;
 
 /// What virglrenderer's callbacks reach: the EGL display and contexts.
 struct Gl {
@@ -333,6 +334,8 @@ struct Gl {
     surface: EglSurface,
     /// Fences virglrenderer reported done, not yet collected.
     retired: RefCell<Vec<u32>>,
+    /// Venus fences retired on their individual context timelines.
+    retired_context: RefCell<Vec<ContextFence>>,
     /// CRATE_GL_DEBUG: debug contexts, their messages logged.
     debug: bool,
 }
@@ -434,6 +437,12 @@ extern "C" fn write_fence(cookie: *mut c_void, fence: u32) {
     // SAFETY: the cookie is the renderer's Gl, alive while virglrenderer is.
     let gl = unsafe { &*(cookie as *const Gl) };
     gl.retired.borrow_mut().push(fence);
+}
+
+extern "C" fn write_context_fence(cookie: *mut c_void, context: u32, ring_idx: u32, fence: u64) {
+    // SAFETY: the cookie is the renderer's Gl, alive while virglrenderer is.
+    let gl = unsafe { &*(cookie as *const Gl) };
+    gl.retired_context.borrow_mut().push(ContextFence { context, ring_idx, fence });
 }
 
 extern "C" fn create_gl_context(
@@ -543,6 +552,7 @@ struct Inner {
     blob_backings: HashMap<u32, Box<[libc::iovec]>>,
     blobs: Option<BlobFunctions>,
     context_create_with_flags: Option<ContextCreateWithFlags>,
+    context_create_fence: Option<ContextCreateFence>,
     /// Fences made and not yet retired, oldest first.
     fences: VecDeque<u64>,
     _libraries: [Library; 2],
@@ -558,6 +568,9 @@ impl Inner {
         let blobs = BlobFunctions::load(&virgl_library);
         let context_create_with_flags = virgl_library.symbol("virgl_renderer_context_create_with_flags").ok().map(|symbol| unsafe {
             std::mem::transmute::<*mut c_void, ContextCreateWithFlags>(symbol)
+        });
+        let context_create_fence = virgl_library.symbol("virgl_renderer_context_create_fence").ok().map(|symbol| unsafe {
+            std::mem::transmute::<*mut c_void, ContextCreateFence>(symbol)
         });
         if let Ok(set_log) = virgl_library.symbol("virgl_set_log_callback") {
             // SAFETY: virglrenderer's function of that name.
@@ -623,6 +636,7 @@ impl Inner {
             primary: ptr::null_mut(),
             surface: ptr::null_mut(),
             retired: RefCell::new(Vec::new()),
+            retired_context: RefCell::new(Vec::new()),
             debug: std::env::var_os("CRATE_GL_DEBUG").is_some(),
         });
         if !extensions
@@ -662,7 +676,7 @@ impl Inner {
             destroy_gl_context,
             make_current,
             get_drm_fd: None,
-            write_context_fence: None,
+            write_context_fence: Some(write_context_fence),
             get_server_fd: None,
             get_egl_display,
         });
@@ -691,6 +705,7 @@ impl Inner {
             blob_backings: HashMap::new(),
             blobs,
             context_create_with_flags,
+            context_create_fence,
             fences: VecDeque::new(),
             _libraries: [egl_library, virgl_library],
         })
@@ -1027,6 +1042,11 @@ impl Inner {
         [CAPSET_VIRGL, CAPSET_VIRGL2, CAPSET_VENUS]
             .iter()
             .filter_map(|&id| {
+                if id == CAPSET_VENUS
+                    && (self.context_create_with_flags.is_none() || self.context_create_fence.is_none())
+                {
+                    return None;
+                }
                 let (mut max_version, mut max_size) = (0, 0);
                 // SAFETY: two out-parameters.
                 unsafe {
