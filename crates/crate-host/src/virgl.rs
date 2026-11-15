@@ -1013,8 +1013,22 @@ impl Renderer for Virgl {
         self.inner().create_fence(fence, context)
     }
 
+    fn create_context_fence(
+        &mut self,
+        context: u32,
+        flags: u32,
+        ring_idx: u32,
+        fence: u64,
+    ) -> RendererResult<()> {
+        self.inner().create_context_fence(context, flags, ring_idx, fence)
+    }
+
     fn poll(&mut self) -> Vec<u64> {
         self.inner().poll()
+    }
+
+    fn poll_context_fences(&mut self) -> Vec<ContextFence> {
+        self.inner().poll_context_fences()
     }
 
     fn read(
