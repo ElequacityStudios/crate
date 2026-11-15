@@ -19,7 +19,6 @@
 //! virglrenderer calls back into this module for its GL contexts and fences on
 //! that thread, from inside the calls made to it.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
@@ -335,9 +334,9 @@ struct Gl {
     /// A 1x1 surface for EGLs without surfaceless contexts; null otherwise.
     surface: EglSurface,
     /// Fences virglrenderer reported done, not yet collected.
-    retired: RefCell<Vec<u32>>,
+    retired: Mutex<Vec<u32>>,
     /// Venus fences retired on their individual context timelines.
-    retired_context: RefCell<Vec<ContextFence>>,
+    retired_context: Mutex<Vec<ContextFence>>,
     /// CRATE_GL_DEBUG: debug contexts, their messages logged.
     debug: bool,
 }
@@ -438,13 +437,13 @@ extern "C" fn gl_message(
 extern "C" fn write_fence(cookie: *mut c_void, fence: u32) {
     // SAFETY: the cookie is the renderer's Gl, alive while virglrenderer is.
     let gl = unsafe { &*(cookie as *const Gl) };
-    gl.retired.borrow_mut().push(fence);
+    gl.retired.lock().unwrap().push(fence);
 }
 
 extern "C" fn write_context_fence(cookie: *mut c_void, context: u32, ring_idx: u32, fence: u64) {
     // SAFETY: the cookie is the renderer's Gl, alive while virglrenderer is.
     let gl = unsafe { &*(cookie as *const Gl) };
-    gl.retired_context.borrow_mut().push(ContextFence { context, ring_idx, fence });
+    gl.retired_context.lock().unwrap().push(ContextFence { context, ring_idx, fence });
 }
 
 extern "C" fn create_gl_context(
@@ -637,8 +636,8 @@ impl Inner {
             config,
             primary: ptr::null_mut(),
             surface: ptr::null_mut(),
-            retired: RefCell::new(Vec::new()),
-            retired_context: RefCell::new(Vec::new()),
+            retired: Mutex::new(Vec::new()),
+            retired_context: Mutex::new(Vec::new()),
             debug: std::env::var_os("CRATE_GL_DEBUG").is_some(),
         });
         if !extensions
@@ -810,7 +809,7 @@ impl Inner {
     /// parked is current again, as virglrenderer believes.
     fn resume(&mut self, parked: Parked) {
         self.gl.restore(parked.0);
-        self.gl.retired.borrow_mut().clear();
+        self.gl.retired.lock().unwrap().clear();
     }
 }
 
@@ -1273,13 +1272,13 @@ impl Inner {
     }
 
     fn poll_context_fences(&mut self) -> Vec<ContextFence> {
-        std::mem::take(&mut *self.gl.retired_context.borrow_mut())
+        std::mem::take(&mut *self.gl.retired_context.lock().unwrap())
     }
 
     fn poll(&mut self) -> Vec<u64> {
         // SAFETY: a plain call; it may call write_fence.
         unsafe { (self.virgl.virgl_renderer_poll)() };
-        let retired = std::mem::take(&mut *self.gl.retired.borrow_mut());
+        let retired = std::mem::take(&mut *self.gl.retired.lock().unwrap());
         let mut done = Vec::new();
         for low in retired {
             // In order: everything up to the one retired.
@@ -1396,7 +1395,7 @@ impl Inner {
         }
         self.fences.clear();
         self.gl.retired.borrow_mut().clear();
-        self.gl.retired_context.borrow_mut().clear();
+        self.gl.retired_context.lock().unwrap().clear();
         // SAFETY: a plain call.
         unsafe { (self.virgl.virgl_renderer_reset)() };
     }
