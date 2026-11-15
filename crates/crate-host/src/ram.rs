@@ -66,3 +66,178 @@ unsafe impl RamBlock for AnonymousRam {
         self.len
     }
 }
+
+
+/// Anonymous guest RAM reserved for virtio-gpu host-visible blob mappings.
+/// Individual ranges can be replaced with MAP_SHARED mappings of renderer-exported
+/// POSIX shared-memory FDs while preserving the window's stable host virtual address.
+pub struct HostVisiblePool {
+    ram: AnonymousRam,
+    guest_addr: u64,
+    page_size: usize,
+    mappings: std::sync::Mutex<std::collections::BTreeMap<u64, usize>>,
+}
+
+impl HostVisiblePool {
+    pub fn new(guest_addr: u64, len: usize) -> Result<Self> {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page <= 0 {
+            return Err(Error::NoMemory("could not determine host page size".into()));
+        }
+        let page_size = page as usize;
+        if len == 0 || len % page_size != 0 || guest_addr % page_size as u64 != 0 {
+            return Err(Error::InvalidArgument(
+                "host-visible region must be nonzero and page aligned".into(),
+            ));
+        }
+        Ok(Self {
+            ram: AnonymousRam::new(len)?,
+            guest_addr,
+            page_size,
+            mappings: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        })
+    }
+
+    fn range(&self, guest_addr: u64, len: usize) -> Result<(*mut libc::c_void, usize)> {
+        let offset = guest_addr
+            .checked_sub(self.guest_addr)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| Error::InvalidArgument("address precedes host-visible region".into()))?;
+        let mapped_len = len
+            .checked_add(self.page_size - 1)
+            .map(|n| n / self.page_size * self.page_size)
+            .ok_or_else(|| Error::InvalidArgument("mapping length overflow".into()))?;
+        if len == 0
+            || guest_addr % self.page_size as u64 != 0
+            || offset.checked_add(mapped_len).is_none_or(|end| end > self.ram.len())
+        {
+            return Err(Error::InvalidArgument(
+                "blob mapping is empty, unaligned, or outside the host-visible region".into(),
+            ));
+        }
+        let ptr = unsafe { self.ram.as_ptr().add(offset).cast::<libc::c_void>() };
+        Ok((ptr, mapped_len))
+    }
+}
+
+// SAFETY: the wrapped anonymous mapping is stable for the pool's lifetime and
+// is page-aligned; MAP_FIXED only replaces pages within that same reserved range.
+unsafe impl RamBlock for HostVisiblePool {
+    fn as_ptr(&self) -> *mut u8 {
+        self.ram.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.ram.len()
+    }
+}
+
+impl crate_core::memory::HostVisibleMemory for HostVisiblePool {
+    fn guest_addr(&self) -> u64 {
+        self.guest_addr
+    }
+
+    fn map_fd(&self, guest_addr: u64, fd: std::os::fd::RawFd, len: usize) -> std::io::Result<()> {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        let (ptr, mapped_len) = self
+            .range(guest_addr, len)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        let end = guest_addr
+            .checked_add(mapped_len as u64)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "mapping address overflow"))?;
+        let mut mappings = self.mappings.lock().unwrap();
+        if mappings
+            .range(..=guest_addr)
+            .next_back()
+            .is_some_and(|(start, size)| *start + *size as u64 > guest_addr)
+            || mappings
+                .range((Excluded(guest_addr), Unbounded))
+                .next()
+                .is_some_and(|(start, _)| *start < end)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "host-visible blob mapping overlaps an existing mapping",
+            ));
+        }
+        let mapped = unsafe {
+            libc::mmap(
+                ptr,
+                mapped_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        if mapped != ptr {
+            return Err(std::io::Error::other("MAP_FIXED returned an unexpected address"));
+        }
+        mappings.insert(guest_addr, mapped_len);
+        Ok(())
+    }
+
+    fn unmap(&self, guest_addr: u64) -> std::io::Result<()> {
+        let mapped_len = self
+            .mappings
+            .lock()
+            .unwrap()
+            .remove(&guest_addr)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "blob mapping not found"))?;
+        let offset = usize::try_from(guest_addr - self.guest_addr)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid blob address"))?;
+        let ptr = unsafe { self.ram.as_ptr().add(offset).cast::<libc::c_void>() };
+        let mapped = unsafe {
+            libc::mmap(
+                ptr,
+                mapped_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod host_visible_pool_tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    #[test]
+    fn maps_and_unmaps_shared_fd_at_guest_physical_address() {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let guest_base = 0x4000_0000;
+        let pool = HostVisiblePool::new(guest_base, page * 4).unwrap();
+        let name = CString::new(format!("/crate-host-visible-{}", std::process::id())).unwrap();
+        let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600) };
+        assert!(fd >= 0, "shm_open: {}", std::io::Error::last_os_error());
+        unsafe { libc::shm_unlink(name.as_ptr()) };
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        assert_eq!(unsafe { libc::ftruncate(file.as_raw_fd(), page as i64) }, 0);
+        let byte = [0x5a_u8];
+        assert_eq!(unsafe { libc::pwrite(file.as_raw_fd(), byte.as_ptr().cast(), 1, 0) }, 1);
+
+        let blob_addr = guest_base + page as u64;
+        pool.map_fd(blob_addr, file.as_raw_fd(), page).unwrap();
+        let mapped = unsafe { pool.as_ptr().add(page) };
+        assert_eq!(unsafe { *mapped }, 0x5a);
+        unsafe { *mapped = 0xa5 };
+        let mut readback = [0_u8];
+        assert_eq!(unsafe { libc::pread(file.as_raw_fd(), readback.as_mut_ptr().cast(), 1, 0) }, 1);
+        assert_eq!(readback[0], 0xa5);
+
+        pool.unmap(blob_addr).unwrap();
+        assert_eq!(unsafe { *mapped }, 0);
+    }
+}

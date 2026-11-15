@@ -33,6 +33,13 @@ pub unsafe trait RamBlock: Send + Sync {
     }
 }
 
+/// A guest-physical shared-memory window backed by renderer-exported file descriptors.
+pub trait HostVisibleMemory: RamBlock {
+    fn guest_addr(&self) -> u64;
+    fn map_fd(&self, guest_addr: u64, fd: std::os::fd::RawFd, len: usize) -> std::io::Result<()>;
+    fn unmap(&self, guest_addr: u64) -> std::io::Result<()>;
+}
+
 /// RAM from the Rust heap, zeroed. For tests and for hosts with nothing better;
 /// real machines use a host backend's mapping.
 pub struct HeapRam {
