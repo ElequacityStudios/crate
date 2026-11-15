@@ -212,30 +212,42 @@ impl crate_core::memory::HostVisibleMemory for HostVisiblePool {
 mod host_visible_pool_tests {
     use super::*;
     use crate_core::memory::HostVisibleMemory;
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn maps_and_unmaps_shared_fd_at_guest_physical_address() {
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let guest_base = 0x4000_0000;
         let pool = HostVisiblePool::new(guest_base, page * 4).unwrap();
-        let name = CString::new(format!("/crate-host-visible-{}", std::process::id())).unwrap();
-        let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600) };
-        assert!(fd >= 0, "shm_open: {}", std::io::Error::last_os_error());
-        unsafe { libc::shm_unlink(name.as_ptr()) };
-        let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        assert_eq!(unsafe { libc::ftruncate(file.as_raw_fd(), page as i64) }, 0);
-        let byte = [0x5a_u8];
-        assert_eq!(unsafe { libc::pwrite(file.as_raw_fd(), byte.as_ptr().cast(), 1, 0) }, 1);
+
+        // macOS POSIX shm descriptors do not behave like ordinary files for
+        // pwrite on every runner version. An unlinked regular file exercises
+        // the same mmap(MAP_SHARED) FD contract without that platform quirk.
+        let path = std::env::temp_dir().join(format!(
+            "crate-host-visible-{}-{}.tmp",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        file.set_len(page as u64).unwrap();
+        file.write_all(&[0x5a]).unwrap();
+        file.flush().unwrap();
 
         let blob_addr = guest_base + page as u64;
         pool.map_fd(blob_addr, file.as_raw_fd(), page).unwrap();
         let mapped = unsafe { pool.as_ptr().add(page) };
         assert_eq!(unsafe { *mapped }, 0x5a);
         unsafe { *mapped = 0xa5 };
+        file.seek(SeekFrom::Start(0)).unwrap();
         let mut readback = [0_u8];
-        assert_eq!(unsafe { libc::pread(file.as_raw_fd(), readback.as_mut_ptr().cast(), 1, 0) }, 1);
+        file.read_exact(&mut readback).unwrap();
         assert_eq!(readback[0], 0xa5);
 
         pool.unmap(blob_addr).unwrap();
