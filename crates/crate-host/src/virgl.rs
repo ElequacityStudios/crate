@@ -87,6 +87,7 @@ const VIRGL_RENDERER_USE_GLES: c_int = 1 << 4;
 const VIRGL_RENDERER_CALLBACKS_VERSION: c_int = 4;
 const CAPSET_VIRGL: u32 = 1;
 const CAPSET_VIRGL2: u32 = 2;
+const CAPSET_VENUS: u32 = 4;
 
 #[repr(C)]
 struct GlContextParam {
@@ -1017,7 +1018,7 @@ impl Renderer for Virgl {
 /// The renderer's work, which `Virgl` passes on.
 impl Inner {
     fn capsets(&self) -> Vec<Capset> {
-        [CAPSET_VIRGL, CAPSET_VIRGL2]
+        [CAPSET_VIRGL, CAPSET_VIRGL2, CAPSET_VENUS]
             .iter()
             .filter_map(|&id| {
                 let (mut max_version, mut max_size) = (0, 0);
