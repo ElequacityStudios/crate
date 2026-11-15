@@ -774,18 +774,21 @@ impl Worker {
                             request.fence,
                         )
                     });
-                    if matches!(result, Some(Ok(()))) {
-                        self.context_fenced.push_back(FencedContext {
-                            context: request.context,
-                            ring_idx: request.ring as u32,
-                            fence: request.fence,
-                            chain,
-                            answer,
-                        });
-                        continue;
-                    }
-                    if let Some(Err(e)) = result {
-                        warn!("virtio-gpu: context fence {}:{}:{}: {e}", request.context, request.ring, request.fence);
+                    match result {
+                        Some(Ok(())) => {
+                            self.context_fenced.push_back(FencedContext {
+                                context: request.context,
+                                ring_idx: request.ring as u32,
+                                fence: request.fence,
+                                chain,
+                                answer,
+                            });
+                            continue;
+                        }
+                        Some(Err(e)) => {
+                            warn!("virtio-gpu: context fence {}:{}:{}: {e}", request.context, request.ring, request.fence);
+                        }
+                        None => {}
                     }
                     answer = request.answer(RESP_ERR_UNSPEC, &[]);
                 } else {
