@@ -6,7 +6,7 @@
 //! keeps itself, a cursor, an EDID with the display's modes, and, with a host
 //! renderer (`crate_core::gpu::Renderer`, virglrenderer in practice), the 3D
 //! commands: capability sets, contexts, 3D resources, transfers, command
-//! submission and fences. No blob resources yet.
+//! submission and fences, plus host-visible blobs and blob scanout.
 //!
 //! Every command runs on the device's own thread, the GPU thread, which owns
 //! the renderer (a GL context is current on one thread). A vCPU's notify only
@@ -75,6 +75,7 @@ const CMD_GET_CAPSET_INFO: u32 = 0x0108;
 const CMD_GET_CAPSET: u32 = 0x0109;
 const CMD_GET_EDID: u32 = 0x010a;
 const CMD_RESOURCE_CREATE_BLOB: u32 = 0x010c;
+const CMD_SET_SCANOUT_BLOB: u32 = 0x010d;
 const CMD_CTX_CREATE: u32 = 0x0200;
 const CMD_CTX_DESTROY: u32 = 0x0201;
 const CMD_CTX_ATTACH_RESOURCE: u32 = 0x0202;
@@ -479,7 +480,7 @@ enum Kind {
     /// The renderer's.
     Renderer,
     /// A virtio-gpu host3D blob; `mapped` is its offset in host-visible RAM.
-    Blob { memory: u32, size: u64, mapped: Option<u64> },
+    Blob { memory: u32, size: u64, mapped: Option<u64>, backing: Vec<Piece>, backing_len: usize },
 }
 
 struct Resource {
@@ -500,6 +501,13 @@ struct Cursor {
     drawn: Rect,
 }
 
+#[derive(Clone, Copy, Default)]
+struct BlobScanout {
+    offset: u64,
+    stride: u32,
+    format: u32,
+}
+
 #[derive(Clone, Default)]
 struct Scanout {
     /// 0 while off.
@@ -508,6 +516,8 @@ struct Scanout {
     rect: Rect,
     /// What the screen shows, R, G, B, A, without the cursor.
     screen: Vec<u8>,
+    /// Blob framebuffer layout for SET_SCANOUT_BLOB.
+    blob: Option<BlobScanout>,
     /// Flushes were skipped while nobody watched.
     stale: bool,
     cursor: Cursor,
@@ -726,6 +736,7 @@ impl Worker {
         self.bytes_2d = 0;
         for scanout in &mut self.scanouts {
             scanout.resource = 0;
+            scanout.blob = None;
             scanout.cursor = Cursor::default();
         }
     }
@@ -1003,6 +1014,7 @@ impl Worker {
             }
             CMD_RESOURCE_CREATE_2D => self.create_2d(r),
             CMD_RESOURCE_CREATE_BLOB => self.create_blob(r),
+            CMD_SET_SCANOUT_BLOB => self.set_scanout_blob(r),
             CMD_RESOURCE_MAP_BLOB => {
                 return match self.map_blob(r) {
                     Ok(map_info) => {
@@ -1081,6 +1093,7 @@ impl Worker {
         }
 
         let mut backing = Vec::with_capacity(count as usize);
+        let mut backing_pieces = Vec::with_capacity(count as usize);
         let mut total = 0u64;
         if count != 0 {
             let memory = self.memory.as_ref().ok_or(RESP_ERR_UNSPEC)?;
@@ -1094,13 +1107,17 @@ impl Worker {
                 let ptr = memory
                     .host_range(address, len as u64)
                     .map_err(|_| RESP_ERR_INVALID_PARAMETER)?;
+                let start = usize::try_from(total).map_err(|_| RESP_ERR_INVALID_PARAMETER)?;
                 total = total.checked_add(len as u64).ok_or(RESP_ERR_INVALID_PARAMETER)?;
-                backing.push(HostSlice { ptr, len });
+                let slice = HostSlice { ptr, len };
+                backing.push(slice);
+                backing_pieces.push(Piece { start, slice });
             }
             if total < size {
                 return Err(RESP_ERR_INVALID_PARAMETER);
             }
         }
+        let backing_len = usize::try_from(total).map_err(|_| RESP_ERR_INVALID_PARAMETER)?;
 
         let blob = BlobResource {
             id,
@@ -1127,6 +1144,8 @@ impl Worker {
                     memory: memory_kind,
                     size,
                     mapped: None,
+                    backing: backing_pieces,
+                    backing_len,
                 },
             },
         );
@@ -1138,7 +1157,7 @@ impl Worker {
         let offset = r.u64(8);
         let (memory_kind, size, already_mapped) = match self.resources.get(&id) {
             Some(Resource {
-                kind: Kind::Blob { memory, size, mapped },
+                kind: Kind::Blob { memory, size, mapped, .. },
                 ..
             }) => (*memory, *size, mapped.is_some()),
             Some(_) => return Err(RESP_ERR_INVALID_PARAMETER),
@@ -1298,6 +1317,7 @@ impl Worker {
         for scanout in &mut self.scanouts {
             if scanout.resource == id {
                 scanout.resource = 0;
+                scanout.blob = None;
             }
         }
         Ok(())
@@ -1320,6 +1340,7 @@ impl Worker {
             // Off: the screen goes black.
             let scanout = &mut self.scanouts[index];
             scanout.resource = 0;
+            scanout.blob = None;
             scanout.screen.fill(0);
             let all = Rect::new(0, 0, scanout.width(), scanout.height());
             self.show(index, all);
@@ -1329,7 +1350,10 @@ impl Worker {
             .resources
             .get(&id)
             .ok_or(RESP_ERR_INVALID_RESOURCE_ID)?;
-        if rect.is_empty() || rect.clip(resource.width, resource.height) != rect {
+        if matches!(&resource.kind, Kind::Blob { .. })
+            || rect.is_empty()
+            || rect.clip(resource.width, resource.height) != rect
+        {
             return Err(RESP_ERR_INVALID_PARAMETER);
         }
         let scanout = &mut self.scanouts[index];
@@ -1344,6 +1368,82 @@ impl Worker {
         }
         scanout.resource = id;
         scanout.rect = rect;
+        scanout.blob = None;
+        Ok(())
+    }
+
+    fn set_scanout_blob(&mut self, r: &Request) -> Result<(), u32> {
+        if r.body.len() < 72 {
+            return Err(RESP_ERR_INVALID_PARAMETER);
+        }
+        let rect = r.rect(0);
+        let index = r.u32(16) as usize;
+        let id = r.u32(20);
+        let (width, height, format, stride, offset) =
+            (r.u32(24), r.u32(28), r.u32(32), r.u32(40), r.u32(56));
+        if index >= self.scanouts.len() {
+            return Err(RESP_ERR_INVALID_SCANOUT_ID);
+        }
+        if id == 0 {
+            let mut w = self.shared.work.lock().unwrap();
+            if matches!(w.plug, Plug::Out { seen: true, .. }) {
+                w.plug_in();
+            }
+            drop(w);
+            let scanout = &mut self.scanouts[index];
+            scanout.resource = 0;
+            scanout.blob = None;
+            scanout.screen.fill(0);
+            scanout.stale = false;
+            let all = Rect::new(0, 0, scanout.width(), scanout.height());
+            self.show(index, all);
+            return Ok(());
+        }
+        if !format::supported(format)
+            || width == 0
+            || height == 0
+            || stride < width.checked_mul(4).ok_or(RESP_ERR_INVALID_PARAMETER)?
+            || stride % 4 != 0
+            || r.u32(36) != 0
+            || r.u32(44) != 0 || r.u32(48) != 0 || r.u32(52) != 0
+            || r.u32(60) != 0 || r.u32(64) != 0 || r.u32(68) != 0
+            || rect.is_empty()
+            || rect.clip(width, height) != rect
+        {
+            return Err(RESP_ERR_INVALID_PARAMETER);
+        }
+        let resource = self.resources.get(&id).ok_or(RESP_ERR_INVALID_RESOURCE_ID)?;
+        let (memory_kind, size, mapped, backing_len) = match &resource.kind {
+            Kind::Blob { memory, size, mapped, backing_len, .. } =>
+                (*memory, *size, mapped.is_some(), *backing_len),
+            _ => return Err(RESP_ERR_INVALID_PARAMETER),
+        };
+        let end = (offset as u64)
+            .checked_add(stride as u64 * height as u64)
+            .ok_or(RESP_ERR_INVALID_PARAMETER)?;
+        if end > size || (memory_kind == 1 && end > backing_len as u64)
+            || (memory_kind != 1 && !mapped)
+        {
+            return Err(RESP_ERR_INVALID_PARAMETER);
+        }
+        let screen_len = (rect.width as usize)
+            .checked_mul(rect.height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or(RESP_ERR_INVALID_PARAMETER)?;
+        let scanout = &mut self.scanouts[index];
+        if scanout.screen.len() != screen_len
+            || (scanout.width(), scanout.height()) != (rect.width, rect.height)
+        {
+            scanout.screen = vec![0; screen_len];
+        }
+        scanout.resource = id;
+        scanout.rect = rect;
+        scanout.blob = Some(BlobScanout { offset: offset as u64, stride, format });
+        scanout.stale = true;
+        let resource = self.resources.get_mut(&id).unwrap();
+        resource.width = width;
+        resource.height = height;
+        resource.format = format;
         Ok(())
     }
 
@@ -1433,10 +1533,34 @@ impl Worker {
                     warn!("virtio-gpu: reading resource {}: {e}", scanout.resource);
                 }
             }
-            Kind::Blob { .. } => {
-                // Blob scanout uses SET_SCANOUT_BLOB, which is not yet
-                // advertised; never reinterpret an opaque blob as a 2D texture.
-                return;
+            Kind::Blob { memory, mapped, backing, backing_len, .. } => {
+                let Some(blob) = scanout.blob else { return };
+                for line in 0..area.height as usize {
+                    let source_offset = blob.offset
+                        .checked_add((area.y as u64 + line as u64) * blob.stride as u64)
+                        .and_then(|n| n.checked_add(area.x as u64 * 4));
+                    let Some(source_offset) = source_offset else { return };
+                    let to = start + line * stride;
+                    let out = &mut scanout.screen[to..to + row];
+                    if *memory == 1 {
+                        if copy_from_backing(backing, *backing_len, source_offset as usize, out).is_err() {
+                            warn!("virtio-gpu: reading guest blob {}", scanout.resource);
+                            return;
+                        }
+                    } else {
+                        let Some(mapped_offset) = mapped else { return };
+                        let Some(host_memory) = &self.host_visible_memory else { return };
+                        let Some(guest_memory) = &self.memory else { return };
+                        let Some(address) = host_memory.guest_addr()
+                            .checked_add(*mapped_offset)
+                            .and_then(|base| base.checked_add(source_offset))
+                        else { return };
+                        let Ok(source) = guest_memory.host_range(address, row as u64) else { return };
+                        // SAFETY: the mapped blob range is held until unmap or unref.
+                        unsafe { ptr::copy_nonoverlapping(source, out.as_mut_ptr(), row) };
+                    }
+                    format::to_rgba(blob.format, out);
+                }
             }
         }
     }
