@@ -757,7 +757,8 @@ fn gl_string(gl: &GlFunctions, name: u32) -> String {
     }
 }
 
-/// The display: ANGLE on the platform asked for, or EGL's default.
+/// Opens the requested ANGLE backend. Never silently fall back from Vulkan:
+/// ANGLE's Metal backend is limited to GLES 3.0, which downgrades guest GL.
 fn open_display(egl: &EglFunctions) -> Result<(EglDisplay, &'static str)> {
     let wanted = std::env::var("CRATE_ANGLE_PLATFORM").unwrap_or_default();
     let angle_env = std::env::var_os("ANGLE_DEFAULT_PLATFORM").is_some();
@@ -769,39 +770,38 @@ fn open_display(egl: &EglFunctions) -> Result<(EglDisplay, &'static str)> {
         _ => Some((EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE, "Vulkan")),
     };
     if let Some((kind, name)) = platform {
-        if let Ok(get) = egl.proc("eglGetPlatformDisplayEXT") {
-            type GetPlatformDisplay =
-                unsafe extern "C" fn(u32, *mut c_void, *const i32) -> EglDisplay;
-            // SAFETY: EGL_EXT_platform_base's signature, whose attributes are
-            // EGLint (EGL 1.5's eglGetPlatformDisplay takes EGLAttrib).
-            let get = unsafe { std::mem::transmute::<*mut c_void, GetPlatformDisplay>(get) };
-            let attribs = [EGL_PLATFORM_ANGLE_TYPE_ANGLE, kind, EGL_NONE];
-            // SAFETY: ANGLE's platform with attributes ending in EGL_NONE.
-            let display =
-                unsafe { get(EGL_PLATFORM_ANGLE_ANGLE, ptr::null_mut(), attribs.as_ptr()) };
-            if !display.is_null() {
-                return Ok((display, name));
-            }
-            warn!("virgl: ANGLE has no {name} display; trying EGL's default");
+        let get = egl.proc("eglGetPlatformDisplayEXT").map_err(|e| {
+            Error::Unsupported(format!("ANGLE {name} backend unavailable: {e}"))
+        })?;
+        type GetPlatformDisplay =
+            unsafe extern "C" fn(u32, *mut c_void, *const i32) -> EglDisplay;
+        // SAFETY: EGL_EXT_platform_base's signature, whose attributes are
+        // EGLint (EGL 1.5's eglGetPlatformDisplay takes EGLAttrib).
+        let get = unsafe { std::mem::transmute::<*mut c_void, GetPlatformDisplay>(get) };
+        let attribs = [EGL_PLATFORM_ANGLE_TYPE_ANGLE, kind, EGL_NONE];
+        // SAFETY: ANGLE's platform with attributes ending in EGL_NONE.
+        let display =
+            unsafe { get(EGL_PLATFORM_ANGLE_ANGLE, ptr::null_mut(), attribs.as_ptr()) };
+        if display.is_null() {
+            // SAFETY: a plain EGL call.
+            let error = unsafe { (egl.eglGetError)() };
+            return Err(Error::Unsupported(format!(
+                "ANGLE {name} display creation failed (EGL {error:#x}); refusing a lower-capability backend"
+            )));
         }
+        return Ok((display, name));
     }
-    // SAFETY: EGL_DEFAULT_DISPLAY.
+
+    // EGL_DEFAULT_DISPLAY is used only when explicitly requested, or when the
+    // caller supplied ANGLE_DEFAULT_PLATFORM itself.
     let display = unsafe { (egl.eglGetDisplay)(ptr::null_mut()) };
     if display.is_null() {
-        // SAFETY: a plain EGL call.
         let error = unsafe { (egl.eglGetError)() };
-        if error != EGL_SUCCESS {
-            return Err(Error::Unsupported(format!("no EGL display: {error:#x}")));
-        }
-        return Err(Error::Unsupported("no EGL display".into()));
+        return Err(Error::Unsupported(format!("no EGL default display: {error:#x}")));
     }
     Ok((
         display,
-        if angle_env {
-            "(ANGLE_DEFAULT_PLATFORM)"
-        } else {
-            "default"
-        },
+        if angle_env { "(ANGLE_DEFAULT_PLATFORM)" } else { "default" },
     ))
 }
 
